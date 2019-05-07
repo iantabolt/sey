@@ -1,0 +1,10 @@
+[package]
+name = "sey"
+version = "0.1.0"
+authors = ["Ian Tabolt <ian@tabo.lt>"]
+edition = "2018"
+
+[dependencies]
+grep = "0.2"
+termcolor = "1.0.4"
+walkdir = "2.2.7"
