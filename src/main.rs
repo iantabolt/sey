@@ -70,6 +70,9 @@ struct Cli {
     /// Preview style: old (highlight matches), new (highlight replacements), diff (show both)
     #[arg(long, value_enum, default_value = "diff")]
     preview: Preview,
+    /// One line per match instead of the full diff+context view
+    #[arg(short = 'c', long)]
+    compact: bool,
 }
 
 #[derive(Clone)]
@@ -188,7 +191,11 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     let mut edits: Vec<FileEdit> = Vec::new();
 
     for edit in &rx {
-        print_file_preview(&edit, cli.context, &cli.preview, &mut out)?;
+        if cli.compact {
+            print_file_compact(&edit, &cli.preview, &mut out)?;
+        } else {
+            print_file_preview(&edit, cli.context, &cli.preview, &mut out)?;
+        }
         edits.push(edit);
     }
 
@@ -392,6 +399,32 @@ fn print_interactive_match(
     let end = (change.line_idx + context).min(lines.len().saturating_sub(1));
     let change_map: HashMap<usize, &Change> = [(change.line_idx, change)].into_iter().collect();
     print_hunk(out, lines, &change_map, start, end, preview)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn print_file_compact(edit: &FileEdit, preview: &Preview, out: &mut StandardStream) -> io::Result<()> {
+    let path_spec = spec(Color::Magenta, true);
+    let num = spec(Color::Cyan, false);
+    let yellow_bold = spec(Color::Yellow, true);
+    let green_bold = spec(Color::Green, true);
+
+    out.set_color(&path_spec)?;
+    writeln!(out, "{}", edit.path.display())?;
+    out.reset()?;
+
+    for change in &edit.changes {
+        out.set_color(&num)?;
+        write!(out, "{:>6}  ", change.line_idx + 1)?;
+        out.reset()?;
+        let (segs, highlight) = if *preview == Preview::New {
+            (&change.new_segments, &green_bold)
+        } else {
+            (&change.orig_segments, &yellow_bold)
+        };
+        write_segments(out, segs, highlight)?;
+        writeln!(out)?;
+    }
     writeln!(out)?;
     Ok(())
 }
