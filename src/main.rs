@@ -48,11 +48,16 @@ enum Action {
 #[command(name = "sey", version, about)]
 struct Cli {
     /// Search pattern (regex by default; use -F for a literal string)
-    pattern: String,
+    #[arg(required_unless_present = "edit")]
+    pattern: Option<String>,
     /// Replacement (supports $1 / ${name} capture references)
-    replacement: String,
+    #[arg(required_unless_present = "edit")]
+    replacement: Option<String>,
     /// Files or directories to search (default: current directory)
     paths: Vec<PathBuf>,
+    /// Open live pattern/replacement editor (pattern and replacement become optional)
+    #[arg(short = 'e', long)]
+    edit: bool,
 
     /// Case-insensitive match
     #[arg(short = 'i', long)]
@@ -129,12 +134,25 @@ enum TuiAction {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
+
+    if cli.edit {
+        // In edit mode, any positionals misparse'd into pattern/replacement are actually paths.
+        let mut extra: Vec<PathBuf> = Vec::new();
+        if let Some(p) = cli.pattern.take() { extra.push(PathBuf::from(p)); }
+        if let Some(r) = cli.replacement.take() { extra.push(PathBuf::from(r)); }
+        for p in extra { cli.paths.insert(0, p); }
+        if cli.paths.is_empty() { cli.paths.push(PathBuf::from(".")); }
+        return run_edit_tui(&cli);
+    }
+
     if cli.paths.is_empty() {
         cli.paths.push(PathBuf::from("."));
     }
 
-    let re = build_regex(&cli)?;
-    let rx = spawn_search(&cli, re);
+    let pattern = cli.pattern.as_deref().unwrap();
+    let replacement = cli.replacement.as_deref().unwrap_or("");
+    let re = build_regex(&cli, pattern)?;
+    let rx = spawn_search(&cli, re, replacement.to_string());
 
     if cli.interactive {
         run_interactive(rx, &cli)
@@ -143,11 +161,11 @@ fn main() -> Result<()> {
     }
 }
 
-fn build_regex(cli: &Cli) -> Result<Regex> {
+fn build_regex(cli: &Cli, pattern: &str) -> Result<Regex> {
     let mut pat = if cli.fixed_strings {
-        regex::escape(&cli.pattern)
+        regex::escape(pattern)
     } else {
-        cli.pattern.clone()
+        pattern.to_string()
     };
     if cli.word {
         pat = format!(r"\b(?:{})\b", pat);
@@ -155,17 +173,16 @@ fn build_regex(cli: &Cli) -> Result<Regex> {
     RegexBuilder::new(&pat)
         .case_insensitive(cli.ignore_case)
         .build()
-        .with_context(|| format!("invalid pattern: {}", cli.pattern))
+        .with_context(|| format!("invalid pattern: {}", pattern))
 }
 
-fn spawn_search(cli: &Cli, re: Regex) -> mpsc::Receiver<FileEdit> {
+fn spawn_search(cli: &Cli, re: Regex, replacement: String) -> mpsc::Receiver<FileEdit> {
     let (tx, rx) = mpsc::channel();
 
     let paths = cli.paths.clone();
     let globs = cli.globs.clone();
     let no_ignore = cli.no_ignore;
     let fixed = cli.fixed_strings;
-    let replacement = cli.replacement.clone();
 
     thread::spawn(move || {
         let mut wb = WalkBuilder::new(&paths[0]);
@@ -1069,4 +1086,381 @@ fn confirm() -> io::Result<bool> {
     io::stdin().read_line(&mut input)?;
     let ans = input.trim().to_lowercase();
     Ok(ans == "y" || ans == "yes")
+}
+
+// ── Live edit TUI ─────────────────────────────────────────────────────────────
+
+struct InputField {
+    text: String,
+    cursor: usize, // byte offset
+}
+
+impl InputField {
+    fn new(s: &str) -> Self {
+        Self { text: s.to_owned(), cursor: s.len() }
+    }
+
+    fn insert(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            let prev = self.prev_boundary();
+            self.text.drain(prev..self.cursor);
+            self.cursor = prev;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor < self.text.len() {
+            let next = self.next_boundary();
+            self.text.drain(self.cursor..next);
+        }
+    }
+
+    fn move_left(&mut self) { if self.cursor > 0 { self.cursor = self.prev_boundary(); } }
+    fn move_right(&mut self) { if self.cursor < self.text.len() { self.cursor = self.next_boundary(); } }
+    fn move_to_start(&mut self) { self.cursor = 0; }
+    fn move_to_end(&mut self) { self.cursor = self.text.len(); }
+    fn kill_to_end(&mut self) { self.text.truncate(self.cursor); }
+
+    fn kill_to_start(&mut self) {
+        self.text.drain(..self.cursor);
+        self.cursor = 0;
+    }
+
+    fn kill_word_backward(&mut self) {
+        let before = &self.text[..self.cursor];
+        let end = before.trim_end_matches(|c: char| !c.is_whitespace()).len();
+        let start = before[..end].trim_end_matches(|c: char| c.is_whitespace()).len();
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    fn prev_boundary(&self) -> usize {
+        self.text[..self.cursor].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+    }
+
+    fn next_boundary(&self) -> usize {
+        self.cursor + self.text[self.cursor..].chars().next().map_or(0, |c| c.len_utf8())
+    }
+}
+
+fn handle_input_key(field: &mut InputField, ev: Event) -> bool {
+    match ev {
+        Event::Key(KeyEvent { code: KeyCode::Char(ch), modifiers, .. }) => {
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                match ch {
+                    'a' => { field.move_to_start(); false }
+                    'e' => { field.move_to_end(); false }
+                    'f' => { field.move_right(); false }
+                    'b' => { field.move_left(); false }
+                    'h' => { field.backspace(); true }
+                    'd' => { field.delete_forward(); true }
+                    'k' => { field.kill_to_end(); true }
+                    'u' => { field.kill_to_start(); true }
+                    'w' => { field.kill_word_backward(); true }
+                    _ => false,
+                }
+            } else if modifiers.contains(KeyModifiers::ALT) {
+                match ch {
+                    'd' => { field.kill_word_backward(); true } // alt+d = kill word forward (approx)
+                    _ => false,
+                }
+            } else {
+                field.insert(ch);
+                true
+            }
+        }
+        Event::Key(KeyEvent { code: KeyCode::Backspace, .. }) => { field.backspace(); true }
+        Event::Key(KeyEvent { code: KeyCode::Delete, .. }) => { field.delete_forward(); true }
+        Event::Key(KeyEvent { code: KeyCode::Left, .. }) => { field.move_left(); false }
+        Event::Key(KeyEvent { code: KeyCode::Right, .. }) => { field.move_right(); false }
+        Event::Key(KeyEvent { code: KeyCode::Home, .. }) => { field.move_to_start(); false }
+        Event::Key(KeyEvent { code: KeyCode::End, .. }) => { field.move_to_end(); false }
+        _ => false,
+    }
+}
+
+fn render_input_line(label: &str, field: &InputField, active: bool) -> Line<'static> {
+    let label_style = if active {
+        Style::default().fg(RColor::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(RColor::DarkGray)
+    };
+    let mut spans = vec![Span::styled(label.to_owned(), label_style)];
+    if active {
+        let before = field.text[..field.cursor].to_owned();
+        let (cursor_ch, after) = if field.cursor < field.text.len() {
+            let end = field.cursor
+                + field.text[field.cursor..].chars().next().map_or(0, |c| c.len_utf8());
+            (field.text[field.cursor..end].to_owned(), field.text[end..].to_owned())
+        } else {
+            (" ".to_owned(), String::new())
+        };
+        spans.push(Span::raw(before));
+        spans.push(Span::styled(
+            cursor_ch,
+            Style::default().bg(RColor::White).fg(RColor::Black),
+        ));
+        if !after.is_empty() {
+            spans.push(Span::raw(after));
+        }
+    } else {
+        spans.push(Span::styled(field.text.clone(), Style::default().add_modifier(Modifier::DIM)));
+    }
+    Line::from(spans)
+}
+
+fn run_edit_tui(cli: &Cli) -> Result<()> {
+    let mut pat = InputField::new("");
+    let mut rep = InputField::new("");
+    let mut active: usize = 0; // 0 = pattern, 1 = replacement
+
+    let mut all_lines: Vec<Line<'static>> = Vec::new();
+    let mut all_edits: Vec<FileEdit> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::new();
+    let mut total_matches: usize = 0;
+    let mut search_done = true;
+    let mut scroll: usize = 0;
+    let mut search_rx: Option<mpsc::Receiver<FileEdit>> = None;
+    let mut last_change: Option<std::time::Instant> = None;
+    let mut regex_error: Option<String> = None;
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(Hide)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut tui_action = TuiAction::Abort;
+
+    'edit: loop {
+        // Drain search results.
+        if let Some(ref mut r) = search_rx {
+            loop {
+                match r.try_recv() {
+                    Ok(edit) => {
+                        total_matches += edit.total_matches();
+                        file_starts.push(all_lines.len());
+                        let eff = if rep.text.is_empty() { Preview::Old } else { cli.preview.clone() };
+                        let new_lines =
+                            render_file_to_lines(&edit, cli.context, &eff, cli.compact);
+                        all_lines.extend(new_lines);
+                        all_edits.push(edit);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        search_done = true;
+                        search_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Debounced search trigger.
+        if let Some(t) = last_change {
+            if t.elapsed() >= Duration::from_millis(200) {
+                last_change = None;
+                search_rx = None; // drop old rx → kills old search thread
+                all_lines.clear();
+                all_edits.clear();
+                file_starts.clear();
+                total_matches = 0;
+                scroll = 0;
+                regex_error = None;
+
+                if !pat.text.is_empty() {
+                    match build_regex(cli, &pat.text) {
+                        Ok(re) => {
+                            search_rx = Some(spawn_search(cli, re, rep.text.clone()));
+                            search_done = false;
+                        }
+                        Err(e) => {
+                            regex_error = Some(e.to_string());
+                            search_done = true;
+                        }
+                    }
+                } else {
+                    search_done = true;
+                }
+            }
+        }
+
+        // Snapshot values needed inside draw closure.
+        let total_h = terminal.size()?.height as usize;
+        let vh = total_h.saturating_sub(4); // 2 inputs + 1 border + 1 status
+        scroll = scroll.min(all_lines.len().saturating_sub(vh));
+
+        let pat_line = render_input_line("Pattern:     ", &pat, active == 0);
+        let rep_line = render_input_line("Replacement: ", &rep, active == 1);
+        let visible_end = all_lines.len().min(scroll + vh);
+        let visible: Vec<Line<'static>> = all_lines[scroll..visible_end].to_vec();
+
+        let status_text = if let Some(ref e) = regex_error {
+            format!(" Error: {e}")
+        } else if !search_done {
+            format!(" Searching… {} matches", total_matches)
+        } else if total_matches > 0 {
+            format!(
+                " {} matches in {} files · tab switch field · enter apply · esc quit",
+                total_matches,
+                all_edits.len()
+            )
+        } else if pat.text.is_empty() {
+            " Type a pattern to search".to_string()
+        } else {
+            " No matches".to_string()
+        };
+        let status_style = if regex_error.is_some() {
+            Style::default().bg(RColor::Red).fg(RColor::White)
+        } else {
+            Style::default().bg(RColor::DarkGray)
+        };
+
+        terminal.draw(|f| {
+            let area = f.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Min(0),
+                    Constraint::Length(1),
+                ])
+                .split(area);
+
+            f.render_widget(Paragraph::new(vec![pat_line, rep_line]), chunks[0]);
+
+            f.render_widget(
+                Paragraph::new(visible).block(
+                    ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::TOP)
+                        .border_style(Style::default().fg(RColor::DarkGray)),
+                ),
+                chunks[1],
+            );
+
+            f.render_widget(
+                Paragraph::new(status_text).style(status_style),
+                chunks[2],
+            );
+        })?;
+
+        if !poll(Duration::from_millis(50))? {
+            continue;
+        }
+
+        let vh = terminal.size()?.height.saturating_sub(4) as usize;
+        match read_event()? {
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break 'edit,
+            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                break 'edit;
+            }
+            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                if total_matches > 0 {
+                    tui_action = TuiAction::Apply;
+                    break 'edit;
+                }
+            }
+            // Switch field
+            Event::Key(KeyEvent { code: KeyCode::Tab, .. })
+            | Event::Key(KeyEvent { code: KeyCode::BackTab, .. }) => {
+                active = 1 - active;
+            }
+            // Scroll results
+            Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                scroll = scroll.saturating_add(1);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('p'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                scroll = scroll.saturating_sub(1);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                scroll = scroll.saturating_add(vh);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::ALT) =>
+            {
+                scroll = scroll.saturating_sub(vh);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
+                scroll = scroll.saturating_add(1);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
+                scroll = scroll.saturating_sub(1);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('>'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::ALT) =>
+            {
+                scroll = all_lines.len().saturating_sub(vh);
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('<'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::ALT) =>
+            {
+                scroll = 0;
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('}'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(&s) = file_starts.iter().find(|&&s| s > scroll) {
+                    scroll = s;
+                }
+            }
+            Event::Key(KeyEvent { code: KeyCode::Char('{'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(&s) = file_starts.iter().rev().find(|&&s| s < scroll) {
+                    scroll = s;
+                }
+            }
+            // Everything else goes to the active input field.
+            ev => {
+                let field = if active == 0 { &mut pat } else { &mut rep };
+                if handle_input_key(field, ev) {
+                    last_change = Some(std::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+    terminal.backend_mut().execute(Show)?;
+    disable_raw_mode()?;
+    drop(terminal);
+
+    match tui_action {
+        TuiAction::Apply => {
+            if let Some(r) = search_rx {
+                for edit in r {
+                    all_edits.push(edit);
+                }
+            }
+            if all_edits.is_empty() {
+                eprintln!("No matches.");
+                return Ok(());
+            }
+            let total: usize = all_edits.iter().map(|e| e.total_matches()).sum();
+            for edit in &all_edits {
+                fs::write(&edit.path, &edit.new_text)
+                    .with_context(|| format!("writing {}", edit.path.display()))?;
+            }
+            eprintln!("Replaced {} matches across {} files.", total, all_edits.len());
+        }
+        TuiAction::Interactive | TuiAction::Abort => {
+            eprintln!("Aborted.");
+        }
+    }
+
+    Ok(())
 }
