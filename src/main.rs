@@ -2,9 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::event::{read as read_event, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
@@ -16,8 +20,16 @@ enum Preview {
     Old,
     /// Show replacement line with new text highlighted
     New,
-    /// Show old and new lines side-by-side (diff style)
+    /// Show both old and new lines (diff style)
     Diff,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    Yes,
+    No,
+    All,
+    Quit,
 }
 
 /// Find/replace across files, ripgrep-powered.
@@ -40,9 +52,12 @@ struct Cli {
     /// Treat pattern and replacement as literal text (no regex, no capture refs)
     #[arg(short = 'F', long)]
     fixed_strings: bool,
-    /// Apply without asking for confirmation
+    /// Apply without asking for confirmation (batch mode only)
     #[arg(short = 'y', long)]
     yes: bool,
+    /// Review and apply replacements one at a time
+    #[arg(short = 'I', long)]
+    interactive: bool,
     /// Only touch files matching this glob (repeatable), e.g. -g '*.kt'
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
     globs: Vec<String>,
@@ -57,6 +72,7 @@ struct Cli {
     preview: Preview,
 }
 
+#[derive(Clone)]
 struct Change {
     line_idx: usize,
     orig_segments: Vec<(String, bool)>,
@@ -77,6 +93,13 @@ impl FileEdit {
     }
 }
 
+// Controls what happens after processing a file's changes in interactive mode.
+enum FileControl {
+    Continue,
+    ApplyAll { from_ci: usize },
+    Quit,
+}
+
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     if cli.paths.is_empty() {
@@ -84,29 +107,13 @@ fn main() -> Result<()> {
     }
 
     let re = build_regex(&cli)?;
-    let edits = collect_edits(&cli, &re)?;
+    let rx = spawn_search(&cli, re);
 
-    if edits.is_empty() {
-        eprintln!("No matches.");
-        return Ok(());
+    if cli.interactive {
+        run_interactive(rx, &cli)
+    } else {
+        run_batch(rx, &cli)
     }
-
-    print_preview(&edits, cli.context, &cli.preview)?;
-
-    let total: usize = edits.iter().map(|e| e.total_matches()).sum();
-    eprintln!("\n{} matches in {} files", total, edits.len());
-
-    if !cli.yes && !confirm()? {
-        eprintln!("Aborted.");
-        return Ok(());
-    }
-
-    for edit in &edits {
-        fs::write(&edit.path, &edit.new_text)
-            .with_context(|| format!("writing {}", edit.path.display()))?;
-    }
-    eprintln!("Replaced {} matches across {} files.", total, edits.len());
-    Ok(())
 }
 
 fn build_regex(cli: &Cli) -> Result<Regex> {
@@ -124,41 +131,386 @@ fn build_regex(cli: &Cli) -> Result<Regex> {
         .with_context(|| format!("invalid pattern: {}", cli.pattern))
 }
 
-fn collect_edits(cli: &Cli, re: &Regex) -> Result<Vec<FileEdit>> {
-    let mut wb = WalkBuilder::new(&cli.paths[0]);
-    for p in &cli.paths[1..] {
-        wb.add(p);
-    }
-    if cli.no_ignore {
-        wb.git_ignore(false)
-            .git_global(false)
-            .git_exclude(false)
-            .ignore(false)
-            .hidden(false);
-    }
-    if !cli.globs.is_empty() {
-        let mut ob = OverrideBuilder::new(".");
-        for g in &cli.globs {
-            ob.add(g)?;
+fn spawn_search(cli: &Cli, re: Regex) -> mpsc::Receiver<FileEdit> {
+    let (tx, rx) = mpsc::channel();
+
+    let paths = cli.paths.clone();
+    let globs = cli.globs.clone();
+    let no_ignore = cli.no_ignore;
+    let fixed = cli.fixed_strings;
+    let replacement = cli.replacement.clone();
+
+    thread::spawn(move || {
+        let mut wb = WalkBuilder::new(&paths[0]);
+        for p in &paths[1..] {
+            wb.add(p);
         }
-        wb.overrides(ob.build()?);
+        if no_ignore {
+            wb.git_ignore(false)
+                .git_global(false)
+                .git_exclude(false)
+                .ignore(false)
+                .hidden(false);
+        }
+        if !globs.is_empty() {
+            let mut ob = OverrideBuilder::new(".");
+            for g in &globs {
+                ob.add(g).ok();
+            }
+            if let Ok(overrides) = ob.build() {
+                wb.overrides(overrides);
+            }
+        }
+
+        for dent in wb.build() {
+            let dent = match dent {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if !dent.file_type().map_or(false, |t| t.is_file()) {
+                continue;
+            }
+            if let Some(edit) = process_file(dent.into_path(), &re, &replacement, fixed) {
+                if tx.send(edit).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    rx
+}
+
+// ── Batch mode ───────────────────────────────────────────────────────────────
+
+fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
+    let mut out = StandardStream::stdout(ColorChoice::Auto);
+    let mut edits: Vec<FileEdit> = Vec::new();
+
+    for edit in &rx {
+        print_file_preview(&edit, cli.context, &cli.preview, &mut out)?;
+        edits.push(edit);
     }
 
-    let mut edits = Vec::new();
-    for dent in wb.build() {
-        let dent = match dent {
-            Ok(d) => d,
-            Err(_) => continue,
+    if edits.is_empty() {
+        eprintln!("No matches.");
+        return Ok(());
+    }
+
+    let total: usize = edits.iter().map(|e| e.total_matches()).sum();
+    eprintln!("\n{} matches in {} files", total, edits.len());
+
+    if !cli.yes && !confirm()? {
+        eprintln!("Aborted.");
+        return Ok(());
+    }
+
+    for edit in &edits {
+        fs::write(&edit.path, &edit.new_text)
+            .with_context(|| format!("writing {}", edit.path.display()))?;
+    }
+    eprintln!("Replaced {} matches across {} files.", total, edits.len());
+    Ok(())
+}
+
+// ── Interactive mode ──────────────────────────────────────────────────────────
+
+fn run_interactive(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
+    let mut out = StandardStream::stderr(ColorChoice::Auto);
+    let mut match_num = 0usize;
+    let mut accepted_total = 0usize;
+
+    loop {
+        let edit = match rx.recv() {
+            Ok(e) => e,
+            Err(_) => break,
         };
-        if !dent.file_type().map_or(false, |t| t.is_file()) {
-            continue;
+
+        let mut current_lines = edit.lines.clone();
+        let mut file_modified = false;
+        let mut control = FileControl::Continue;
+
+        for (ci, change) in edit.changes.iter().enumerate() {
+            match_num += 1;
+
+            print_interactive_match(
+                &edit.path,
+                change,
+                match_num,
+                ci,
+                edit.changes.len(),
+                &edit.lines,
+                cli.context,
+                &cli.preview,
+                &mut out,
+            )?;
+
+            eprint!("  y yes   n no   a all   q quit");
+            io::stderr().flush()?;
+
+            let action = read_key()?;
+
+            eprint!("\r\x1b[2K"); // clear the prompt line
+            match action {
+                Action::Yes => {
+                    eprintln!("  \x1b[32m✓\x1b[0m Accepted");
+                    apply_change(&mut current_lines, change);
+                    file_modified = true;
+                    accepted_total += change.match_count;
+                }
+                Action::No => {
+                    eprintln!("  \x1b[2m✗ Skipped\x1b[0m");
+                }
+                Action::All => {
+                    eprintln!("  \x1b[32m✓\x1b[0m Apply all");
+                    control = FileControl::ApplyAll { from_ci: ci };
+                    break;
+                }
+                Action::Quit => {
+                    eprintln!("  \x1b[2mAborted\x1b[0m");
+                    control = FileControl::Quit;
+                    break;
+                }
+            }
         }
-        if let Some(edit) = process_file(dent.into_path(), re, &cli.replacement, cli.fixed_strings) {
-            edits.push(edit);
+
+        match control {
+            FileControl::Continue => {
+                if file_modified {
+                    write_lines(&edit.path, &current_lines)?;
+                }
+            }
+            FileControl::ApplyAll { from_ci } => {
+                // Accept all remaining changes in the current file.
+                for remaining in &edit.changes[from_ci..] {
+                    apply_change(&mut current_lines, remaining);
+                    accepted_total += remaining.match_count;
+                }
+                write_lines(&edit.path, &current_lines)?;
+
+                // Drain remaining files from the channel (blocks until search done).
+                let rest: Vec<FileEdit> = rx.into_iter().collect();
+
+                if !rest.is_empty() {
+                    let rest_total: usize = rest.iter().map(|e| e.total_matches()).sum();
+                    eprintln!();
+                    for f in &rest {
+                        print_file_preview(f, cli.context, &cli.preview, &mut out)?;
+                    }
+                    eprintln!("\n{} remaining matches in {} more files", rest_total, rest.len());
+                    if confirm()? {
+                        for f in &rest {
+                            fs::write(&f.path, &f.new_text)
+                                .with_context(|| format!("writing {}", f.path.display()))?;
+                        }
+                        accepted_total += rest_total;
+                    }
+                }
+
+                eprintln!("\nApplied {} replacements.", accepted_total);
+                return Ok(());
+            }
+            FileControl::Quit => {
+                // Write the current file with whatever was accepted before quit.
+                if file_modified {
+                    write_lines(&edit.path, &current_lines)?;
+                }
+                eprintln!("\nApplied {} replacements.", accepted_total);
+                return Ok(());
+            }
         }
     }
-    Ok(edits)
+
+    if match_num == 0 {
+        eprintln!("No matches.");
+    } else {
+        eprintln!("\nApplied {} replacements.", accepted_total);
+    }
+    Ok(())
 }
+
+fn read_key() -> io::Result<Action> {
+    enable_raw_mode()?;
+    let action = loop {
+        match read_event()? {
+            Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => break Action::Yes,
+            Event::Key(KeyEvent { code: KeyCode::Char('n'), .. }) => break Action::No,
+            Event::Key(KeyEvent { code: KeyCode::Char('a'), .. }) => break Action::All,
+            Event::Key(KeyEvent { code: KeyCode::Char('q'), .. }) => break Action::Quit,
+            Event::Key(KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers,
+                ..
+            }) if modifiers.contains(KeyModifiers::CONTROL) => break Action::Quit,
+            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break Action::Quit,
+            _ => continue,
+        }
+    };
+    disable_raw_mode()?;
+    Ok(action)
+}
+
+fn apply_change(lines: &mut Vec<String>, change: &Change) {
+    let nl = if lines[change.line_idx].ends_with('\n') { "\n" } else { "" };
+    let new_body: String = change.new_segments.iter().map(|(t, _)| t.as_str()).collect();
+    lines[change.line_idx] = format!("{}{}", new_body, nl);
+}
+
+fn write_lines(path: &PathBuf, lines: &[String]) -> Result<()> {
+    let content: String = lines.iter().map(|s| s.as_str()).collect();
+    fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+}
+
+// ── Display ───────────────────────────────────────────────────────────────────
+
+fn print_interactive_match(
+    path: &PathBuf,
+    change: &Change,
+    match_num: usize,
+    change_idx: usize,
+    total_in_file: usize,
+    lines: &[String],
+    context: usize,
+    preview: &Preview,
+    out: &mut StandardStream,
+) -> io::Result<()> {
+    let dim = dimmed();
+    let path_spec = spec(Color::Magenta, true);
+
+    out.set_color(&dim)?;
+    writeln!(out, "──────────────────────────────────────────")?;
+    write!(out, "[#{match_num}] ")?;
+    out.reset()?;
+    out.set_color(&path_spec)?;
+    write!(out, "{}", path.display())?;
+    out.reset()?;
+    out.set_color(&dim)?;
+    writeln!(out, ":{} ({}/{})", change.line_idx + 1, change_idx + 1, total_in_file)?;
+    out.reset()?;
+
+    let start = change.line_idx.saturating_sub(context);
+    let end = (change.line_idx + context).min(lines.len().saturating_sub(1));
+    let change_map: HashMap<usize, &Change> = [(change.line_idx, change)].into_iter().collect();
+    print_hunk(out, lines, &change_map, start, end, preview)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn print_file_preview(
+    edit: &FileEdit,
+    context: usize,
+    preview: &Preview,
+    out: &mut StandardStream,
+) -> io::Result<()> {
+    let path_spec = spec(Color::Magenta, true);
+    let dim = dimmed();
+
+    out.set_color(&path_spec)?;
+    writeln!(out, "{}", edit.path.display())?;
+    out.reset()?;
+
+    let change_map: HashMap<usize, &Change> =
+        edit.changes.iter().map(|c| (c.line_idx, c)).collect();
+    let hunks = build_hunks(&edit.changes, context, edit.lines.len());
+
+    for (hi, hunk) in hunks.iter().enumerate() {
+        if hi > 0 {
+            out.set_color(&dim)?;
+            writeln!(out, "        ⋮")?;
+            out.reset()?;
+        }
+        print_hunk(out, &edit.lines, &change_map, hunk.start, hunk.end, preview)?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+fn print_hunk(
+    out: &mut StandardStream,
+    lines: &[String],
+    change_map: &HashMap<usize, &Change>,
+    start: usize,
+    end: usize,
+    preview: &Preview,
+) -> io::Result<()> {
+    let num = spec(Color::Cyan, false);
+    let dim = dimmed();
+    let yellow_bold = spec(Color::Yellow, true);
+    let green_bold = spec(Color::Green, true);
+    let red_bold = spec(Color::Red, true);
+
+    for line_idx in start..=end {
+        let (body, _) = split_nl(&lines[line_idx]);
+
+        if let Some(change) = change_map.get(&line_idx) {
+            match preview {
+                Preview::Old => {
+                    out.set_color(&num)?;
+                    write!(out, "{:>6}  ", line_idx + 1)?;
+                    out.reset()?;
+                    write_segments(out, &change.orig_segments, &yellow_bold)?;
+                    writeln!(out)?;
+                }
+                Preview::New => {
+                    out.set_color(&num)?;
+                    write!(out, "{:>6}  ", line_idx + 1)?;
+                    out.reset()?;
+                    write_segments(out, &change.new_segments, &green_bold)?;
+                    writeln!(out)?;
+                }
+                Preview::Diff => {
+                    out.set_color(&red_bold)?;
+                    write!(out, "-")?;
+                    out.set_color(&num)?;
+                    write!(out, "{:>5}  ", line_idx + 1)?;
+                    out.reset()?;
+                    write_segments(out, &change.orig_segments, &red_bold)?;
+                    writeln!(out)?;
+
+                    out.set_color(&green_bold)?;
+                    write!(out, "+")?;
+                    out.set_color(&num)?;
+                    write!(out, "{:>5}  ", line_idx + 1)?;
+                    out.reset()?;
+                    write_segments(out, &change.new_segments, &green_bold)?;
+                    writeln!(out)?;
+                }
+            }
+        } else if *preview == Preview::Diff {
+            out.set_color(&dim)?;
+            write!(out, " {:>5}  {}", line_idx + 1, body)?;
+            out.reset()?;
+            writeln!(out)?;
+        } else {
+            out.set_color(&num)?;
+            write!(out, "{:>6}  ", line_idx + 1)?;
+            out.reset()?;
+            out.set_color(&dim)?;
+            write!(out, "{}", body)?;
+            out.reset()?;
+            writeln!(out)?;
+        }
+    }
+    Ok(())
+}
+
+fn write_segments(
+    out: &mut StandardStream,
+    segments: &[(String, bool)],
+    highlight: &ColorSpec,
+) -> io::Result<()> {
+    for (text, is_highlighted) in segments {
+        if *is_highlighted {
+            out.set_color(highlight)?;
+        } else {
+            out.reset()?;
+        }
+        write!(out, "{}", text)?;
+    }
+    out.reset()
+}
+
+// ── File processing ───────────────────────────────────────────────────────────
 
 fn process_file(path: PathBuf, re: &Regex, repl: &str, fixed: bool) -> Option<FileEdit> {
     let text = fs::read_to_string(&path).ok()?;
@@ -238,12 +590,13 @@ fn split_nl(s: &str) -> (&str, &str) {
     }
 }
 
+// ── Hunk grouping ─────────────────────────────────────────────────────────────
+
 struct Hunk {
     start: usize,
     end: usize,
 }
 
-/// Merge overlapping or adjacent context windows into contiguous hunks.
 fn build_hunks(changes: &[Change], context: usize, total_lines: usize) -> Vec<Hunk> {
     let mut hunks: Vec<Hunk> = Vec::new();
     for change in changes {
@@ -260,115 +613,17 @@ fn build_hunks(changes: &[Change], context: usize, total_lines: usize) -> Vec<Hu
     hunks
 }
 
-fn print_preview(edits: &[FileEdit], context: usize, preview: &Preview) -> io::Result<()> {
-    let mut out = StandardStream::stdout(ColorChoice::Auto);
-
-    let path_spec = spec(Color::Magenta, true);
-    let num_spec = spec(Color::Cyan, false);
-    let yellow_bold = spec(Color::Yellow, true);
-    let green_bold = spec(Color::Green, true);
-    let red_bold = spec(Color::Red, true);
-    let dim_spec = {
-        let mut s = ColorSpec::new();
-        s.set_dimmed(true);
-        s
-    };
-
-    for edit in edits {
-        out.set_color(&path_spec)?;
-        writeln!(out, "{}", edit.path.display())?;
-        out.reset()?;
-
-        let change_map: HashMap<usize, &Change> =
-            edit.changes.iter().map(|c| (c.line_idx, c)).collect();
-        let hunks = build_hunks(&edit.changes, context, edit.lines.len());
-
-        for (hi, hunk) in hunks.iter().enumerate() {
-            if hi > 0 {
-                out.set_color(&dim_spec)?;
-                writeln!(out, "        ⋮")?;
-                out.reset()?;
-            }
-
-            for line_idx in hunk.start..=hunk.end {
-                let (body, _) = split_nl(&edit.lines[line_idx]);
-
-                if let Some(change) = change_map.get(&line_idx) {
-                    match preview {
-                        Preview::Old => {
-                            out.set_color(&num_spec)?;
-                            write!(out, "{:>6}  ", line_idx + 1)?;
-                            out.reset()?;
-                            write_segments(&mut out, &change.orig_segments, &yellow_bold)?;
-                            writeln!(out)?;
-                        }
-                        Preview::New => {
-                            out.set_color(&num_spec)?;
-                            write!(out, "{:>6}  ", line_idx + 1)?;
-                            out.reset()?;
-                            write_segments(&mut out, &change.new_segments, &green_bold)?;
-                            writeln!(out)?;
-                        }
-                        Preview::Diff => {
-                            out.set_color(&red_bold)?;
-                            write!(out, "-")?;
-                            out.set_color(&num_spec)?;
-                            write!(out, "{:>5}  ", line_idx + 1)?;
-                            out.reset()?;
-                            write_segments(&mut out, &change.orig_segments, &red_bold)?;
-                            writeln!(out)?;
-
-                            out.set_color(&green_bold)?;
-                            write!(out, "+")?;
-                            out.set_color(&num_spec)?;
-                            write!(out, "{:>5}  ", line_idx + 1)?;
-                            out.reset()?;
-                            write_segments(&mut out, &change.new_segments, &green_bold)?;
-                            writeln!(out)?;
-                        }
-                    }
-                } else {
-                    if *preview == Preview::Diff {
-                        out.set_color(&dim_spec)?;
-                        write!(out, " {:>5}  {}", line_idx + 1, body)?;
-                        out.reset()?;
-                        writeln!(out)?;
-                    } else {
-                        out.set_color(&num_spec)?;
-                        write!(out, "{:>6}  ", line_idx + 1)?;
-                        out.reset()?;
-                        out.set_color(&dim_spec)?;
-                        write!(out, "{}", body)?;
-                        out.reset()?;
-                        writeln!(out)?;
-                    }
-                }
-            }
-        }
-        writeln!(out)?;
-    }
-    Ok(())
-}
-
-fn write_segments(
-    out: &mut StandardStream,
-    segments: &[(String, bool)],
-    highlight: &ColorSpec,
-) -> io::Result<()> {
-    for (text, is_highlighted) in segments {
-        if *is_highlighted {
-            out.set_color(highlight)?;
-        } else {
-            out.reset()?;
-        }
-        write!(out, "{}", text)?;
-    }
-    out.reset()
-}
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn spec(fg: Color, bold: bool) -> ColorSpec {
     let mut s = ColorSpec::new();
     s.set_fg(Some(fg)).set_bold(bold);
+    s
+}
+
+fn dimmed() -> ColorSpec {
+    let mut s = ColorSpec::new();
+    s.set_dimmed(true);
     s
 }
 
