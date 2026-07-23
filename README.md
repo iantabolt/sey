@@ -11,10 +11,20 @@ find/replace-in-path dialog.
 sey 'foo(\w+)' 'bar$1' src/
 ```
 
+![sey renaming a function across a few files, then confirming the change](demo/basic.gif)
+
 Results stream in as files are found. By default `sey` shows a diff-style
 preview of every change and asks for confirmation once before writing anything.
-Pass `-I` to step through each match one at a time (`y`/`n`/`a`/`q`), or `-y`
-to skip confirmation entirely.
+
+Pass `-I` to step through each match one at a time (`y`/`n`/`a`/`q`):
+
+![sey stepping through matches one at a time in interactive mode](demo/interactive.gif)
+
+Pipe the output to another command and `sey` switches to a plain
+`file:line:col:content` listing instead — like `rg --vimgrep` — and makes no
+changes, so it composes cleanly with the rest of your shell:
+
+![sey printing a rich preview normally, then plain vimgrep-style output once piped](demo/pipe.gif)
 
 ## Install
 
@@ -40,8 +50,11 @@ sey [OPTIONS] <PATTERN> <REPLACEMENT> [PATHS]...
 | `-C`, `--context <N>` | lines of context around each match (default 2) |
 | `-I`, `--interactive` | review and apply changes one at a time |
 | `-y`, `--yes` | apply without confirmation |
+| `-c`, `--compact` | one line per match instead of full diff+context |
 | `--no-ignore` | include hidden/gitignored files |
 | `--preview <old\|new\|diff>` | preview style (default `diff`) |
+| `--no-pager` | don't pipe output through a pager |
+| `--vimgrep` | print `file:line:col:content`, one per match, no replacement |
 
 `REPLACEMENT` supports capture references (`$1`, `${name}`) unless `-F` is
 given.
