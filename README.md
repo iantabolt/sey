@@ -1,5 +1,7 @@
 # sey
 
+_`sey` what was once `sed`._
+
 Interactive find/replace across a directory tree, using ripgrep's regex
 engine and file-walking conventions (`.gitignore` aware, glob filters, etc.)
 with a preview-before-you-commit workflow modeled on IntelliJ's
