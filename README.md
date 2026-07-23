@@ -49,3 +49,11 @@ given.
 ## Status
 
 Early and under active development. Flags and defaults may still change.
+
+## Acknowledgements
+
+File walking and `.gitignore` handling via the [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) crate, and regex matching via the [`regex`](https://github.com/rust-lang/regex) crate — both foundational to [ripgrep](https://github.com/BurntSushi/ripgrep) and maintained largely by [Andrew Gallant](https://github.com/BurntSushi).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
