@@ -77,6 +77,10 @@ struct Cli {
     /// Do not pipe output through a pager
     #[arg(long)]
     no_pager: bool,
+    /// Output matches as file:line:col:content (one line per match, no replacement applied).
+    /// Automatically enabled when stdout is piped.
+    #[arg(long)]
+    vimgrep: bool,
 }
 
 #[derive(Clone)]
@@ -191,9 +195,18 @@ fn spawn_search(cli: &Cli, re: Regex) -> mpsc::Receiver<FileEdit> {
 // ── Batch mode ───────────────────────────────────────────────────────────────
 
 fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
+    // vimgrep mode: file:line:col:content, one line per match, no replacement applied.
+    // Triggered explicitly via --vimgrep or automatically when stdout is piped.
+    if cli.vimgrep || !io::stdout().is_terminal() {
+        let mut out = StandardStream::stdout(ColorChoice::Never);
+        for edit in &rx {
+            print_file_vimgrep(&edit, &mut out)?;
+        }
+        return Ok(());
+    }
+
     // Use a pager when stdout is a TTY and --no-pager wasn't given.
-    // Auto-disabled when piped (is_terminal() returns false).
-    let use_pager = !cli.no_pager && io::stdout().is_terminal();
+    let use_pager = !cli.no_pager;
 
     let edits = if use_pager {
         if let Some((mut out, mut child)) = try_spawn_pager() {
@@ -447,6 +460,21 @@ fn print_interactive_match<W: WriteColor>(
     let change_map: HashMap<usize, &Change> = [(change.line_idx, change)].into_iter().collect();
     print_hunk(out, lines, &change_map, start, end, preview)?;
     writeln!(out)?;
+    Ok(())
+}
+
+fn print_file_vimgrep<W: WriteColor>(edit: &FileEdit, out: &mut W) -> io::Result<()> {
+    for change in &edit.changes {
+        let (body, _) = split_nl(&edit.lines[change.line_idx]);
+        let line = change.line_idx + 1;
+        let mut col = 1usize;
+        for (text, is_match) in &change.orig_segments {
+            if *is_match {
+                writeln!(out, "{}:{}:{}:{}", edit.path.display(), line, col, body)?;
+            }
+            col += text.len();
+        }
+    }
     Ok(())
 }
 
