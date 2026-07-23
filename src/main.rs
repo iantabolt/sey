@@ -129,6 +129,7 @@ enum FileControl {
 enum TuiAction {
     Apply,
     Interactive,
+    Edit,
     Abort,
 }
 
@@ -142,7 +143,7 @@ fn main() -> Result<()> {
         if let Some(r) = cli.replacement.take() { extra.push(PathBuf::from(r)); }
         for p in extra { cli.paths.insert(0, p); }
         if cli.paths.is_empty() { cli.paths.push(PathBuf::from(".")); }
-        return run_edit_tui(&cli);
+        return run_edit_tui(&cli, "", "");
     }
 
     if cli.paths.is_empty() {
@@ -352,11 +353,11 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
 
             let status = if search_done {
                 format!(
-                    " {} matches in {} files · y apply · i interactive · q quit",
+                    " {} matches in {} files · y apply · e edit · i interactive · q quit",
                     cur_total, cur_files
                 )
             } else {
-                format!(" Searching… {} matches", cur_total)
+                format!(" Searching… {} matches · y apply · e edit · i interactive · q quit", cur_total)
             };
             f.render_widget(
                 Paragraph::new(status).style(Style::default().bg(RColor::DarkGray)),
@@ -386,6 +387,10 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                 }
                 Event::Key(KeyEvent { code: KeyCode::Char('i'), .. }) => {
                     action = TuiAction::Interactive;
+                    break 'tui;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('e'), .. }) => {
+                    action = TuiAction::Edit;
                     break 'tui;
                 }
                 // ── scroll by line ────────────────────────────────────────
@@ -494,6 +499,12 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                 }
             });
             run_interactive(rx2, cli)?;
+        }
+        TuiAction::Edit => {
+            drop(rx);
+            let pattern = cli.pattern.as_deref().unwrap_or("");
+            let replacement = cli.replacement.as_deref().unwrap_or("");
+            run_edit_tui(cli, pattern, replacement)?;
         }
         TuiAction::Abort => {
             eprintln!("Aborted.");
@@ -1214,9 +1225,9 @@ fn render_input_line(label: &str, field: &InputField, active: bool) -> Line<'sta
     Line::from(spans)
 }
 
-fn run_edit_tui(cli: &Cli) -> Result<()> {
-    let mut pat = InputField::new("");
-    let mut rep = InputField::new("");
+fn run_edit_tui(cli: &Cli, initial_pattern: &str, initial_replacement: &str) -> Result<()> {
+    let mut pat = InputField::new(initial_pattern);
+    let mut rep = InputField::new(initial_replacement);
     let mut active: usize = 0; // 0 = pattern, 1 = replacement
 
     let mut all_lines: Vec<Line<'static>> = Vec::new();
@@ -1226,7 +1237,12 @@ fn run_edit_tui(cli: &Cli) -> Result<()> {
     let mut search_done = true;
     let mut scroll: usize = 0;
     let mut search_rx: Option<mpsc::Receiver<FileEdit>> = None;
-    let mut last_change: Option<std::time::Instant> = None;
+    // If pre-populated, trigger search immediately (backdate the timer).
+    let mut last_change: Option<std::time::Instant> = if initial_pattern.is_empty() {
+        None
+    } else {
+        Some(std::time::Instant::now() - Duration::from_millis(300))
+    };
     let mut regex_error: Option<String> = None;
 
     enable_raw_mode()?;
@@ -1457,7 +1473,7 @@ fn run_edit_tui(cli: &Cli) -> Result<()> {
             }
             eprintln!("Replaced {} matches across {} files.", total, all_edits.len());
         }
-        TuiAction::Interactive | TuiAction::Abort => {
+        TuiAction::Interactive | TuiAction::Edit | TuiAction::Abort => {
             eprintln!("Aborted.");
         }
     }
