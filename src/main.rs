@@ -129,7 +129,6 @@ enum FileControl {
 enum TuiAction {
     Apply,
     Interactive,
-    Edit,
     Abort,
 }
 
@@ -143,7 +142,7 @@ fn main() -> Result<()> {
         if let Some(r) = cli.replacement.take() { extra.push(PathBuf::from(r)); }
         for p in extra { cli.paths.insert(0, p); }
         if cli.paths.is_empty() { cli.paths.push(PathBuf::from(".")); }
-        return run_edit_tui(&cli, "", "");
+        return run_tui(&cli, "", "", true);
     }
 
     if cli.paths.is_empty() {
@@ -230,20 +229,20 @@ fn spawn_search(cli: &Cli, re: Regex, replacement: String) -> mpsc::Receiver<Fil
 
 fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     // vimgrep mode: file:line:col:content, one line per match, no replacement applied.
-    // Triggered explicitly via --vimgrep or automatically when stdout is piped.
     if cli.vimgrep || !io::stdout().is_terminal() {
         let mut out = StandardStream::stdout(ColorChoice::Never);
-        for edit in &rx {
-            print_file_vimgrep(&edit, &mut out)?;
-        }
+        for edit in &rx { print_file_vimgrep(&edit, &mut out)?; }
         return Ok(());
     }
 
-    // TUI pager unless --no-pager or -y (which implies non-interactive).
+    // TUI mode (default).
     if !cli.no_pager && !cli.yes {
-        return run_pager_tui(rx, cli);
+        let pat = cli.pattern.as_deref().unwrap_or("");
+        let rep = cli.replacement.as_deref().unwrap_or("");
+        return run_tui(cli, pat, rep, false);
     }
 
+    // --no-pager / -y: print to stdout then prompt.
     let mut out = StandardStream::stdout(ColorChoice::Auto);
     let edits = collect_and_display(rx, cli, &mut out)?;
 
@@ -253,18 +252,30 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     }
 
     let total: usize = edits.iter().map(|e| e.total_matches()).sum();
-    eprintln!("\n{} matches in {} files", total, edits.len());
 
-    if !cli.yes && !confirm()? {
-        eprintln!("Aborted.");
+    if cli.yes {
+        for edit in &edits {
+            fs::write(&edit.path, &edit.new_text)
+                .with_context(|| format!("writing {}", edit.path.display()))?;
+        }
+        eprintln!("Replaced {total} matches across {} files.", edits.len());
         return Ok(());
     }
 
-    for edit in &edits {
-        fs::write(&edit.path, &edit.new_text)
-            .with_context(|| format!("writing {}", edit.path.display()))?;
+    let pat = cli.pattern.as_deref().unwrap_or("");
+    let rep = cli.replacement.as_deref().unwrap_or("");
+    match prompt_no_pager(total, edits.len())? {
+        PromptChoice::Apply => {
+            for edit in &edits {
+                fs::write(&edit.path, &edit.new_text)
+                    .with_context(|| format!("writing {}", edit.path.display()))?;
+            }
+            eprintln!("Replaced {total} matches across {} files.", edits.len());
+        }
+        PromptChoice::Abort => eprintln!("Aborted."),
+        PromptChoice::Edit => run_tui(cli, pat, rep, true)?,
+        PromptChoice::Pager => run_tui(cli, pat, rep, false)?,
     }
-    eprintln!("Replaced {} matches across {} files.", total, edits.len());
     Ok(())
 }
 
@@ -285,20 +296,33 @@ fn collect_and_display<W: WriteColor>(
     Ok(edits)
 }
 
-fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
-    let first = match rx.recv() {
-        Ok(e) => e,
-        Err(_) => {
-            eprintln!("No matches.");
-            return Ok(());
-        }
-    };
+// ── Unified TUI (view mode + edit mode) ──────────────────────────────────────
+//
+// View mode: full-screen results, y/i/q/e keys, no typing.
+// Edit mode: two input lines at top, live results below, enter/esc to return.
 
-    let mut total_matches = first.total_matches();
-    let mut all_lines = render_file_to_lines(&first, cli.context, &cli.preview, cli.compact);
-    let mut all_edits: Vec<FileEdit> = vec![first];
-    let mut file_starts: Vec<usize> = vec![0];
-    let mut search_done = false;
+fn run_tui(cli: &Cli, init_pat: &str, init_rep: &str, start_in_edit: bool) -> Result<()> {
+    let mut pat = InputField::new(init_pat);
+    let mut rep = InputField::new(init_rep);
+    let mut active_field: usize = 0; // 0 = pattern, 1 = replacement
+    let mut in_edit = start_in_edit;
+    let mut snap_pat = pat.text.clone(); // restored on esc
+    let mut snap_rep = rep.text.clone();
+
+    let mut all_lines: Vec<Line<'static>> = Vec::new();
+    let mut all_edits: Vec<FileEdit> = Vec::new();
+    let mut file_starts: Vec<usize> = Vec::new();
+    let mut total_matches: usize = 0;
+    let mut search_done = true;
+    let mut scroll: usize = 0;
+    let mut search_rx: Option<mpsc::Receiver<FileEdit>> = None;
+    // Backdate so the debounce fires on the first frame when there's an initial pattern.
+    let mut last_change: Option<std::time::Instant> = if init_pat.is_empty() {
+        None
+    } else {
+        Some(std::time::Instant::now() - Duration::from_millis(300))
+    };
+    let mut regex_error: Option<String> = None;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -307,162 +331,202 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut scroll: usize = 0;
-    let mut action = TuiAction::Abort;
+    let mut tui_action = TuiAction::Abort;
 
     'tui: loop {
-        // Drain any results that arrived since the last frame.
-        loop {
-            match rx.try_recv() {
-                Ok(edit) => {
-                    total_matches += edit.total_matches();
-                    let new_lines =
-                        render_file_to_lines(&edit, cli.context, &cli.preview, cli.compact);
-                    file_starts.push(all_lines.len());
-                    all_lines.extend(new_lines);
-                    all_edits.push(edit);
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    search_done = true;
-                    break;
+        // ── drain search results ─────────────────────────────────────────
+        if let Some(ref mut r) = search_rx {
+            loop {
+                match r.try_recv() {
+                    Ok(edit) => {
+                        total_matches += edit.total_matches();
+                        file_starts.push(all_lines.len());
+                        let eff = if rep.text.is_empty() { Preview::Old } else { cli.preview.clone() };
+                        all_lines.extend(render_file_to_lines(&edit, cli.context, &eff, cli.compact));
+                        all_edits.push(edit);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        search_done = true;
+                        search_rx = None;
+                        break;
+                    }
                 }
             }
         }
 
-        // Clamp scroll before rendering.
-        {
-            let h = terminal.size()?.height.saturating_sub(1) as usize;
-            scroll = scroll.min(all_lines.len().saturating_sub(h));
+        // ── debounced search trigger ─────────────────────────────────────
+        if let Some(t) = last_change {
+            if t.elapsed() >= Duration::from_millis(200) {
+                last_change = None;
+                search_rx = None;
+                all_lines.clear(); all_edits.clear(); file_starts.clear();
+                total_matches = 0; scroll = 0; regex_error = None;
+                if !pat.text.is_empty() {
+                    match build_regex(cli, &pat.text) {
+                        Ok(re) => {
+                            search_rx = Some(spawn_search(cli, re, rep.text.clone()));
+                            search_done = false;
+                        }
+                        Err(e) => { regex_error = Some(e.to_string()); search_done = true; }
+                    }
+                } else {
+                    search_done = true;
+                }
+            }
         }
 
-        let cur_scroll = scroll;
-        let cur_total = total_matches;
-        let cur_files = all_edits.len();
+        // ── viewport height (depends on mode) ───────────────────────────
+        let total_h = terminal.size()?.height as usize;
+        // Edit: 2 input rows + 1 border row (inside results block) + 1 status = 4 overhead
+        // View: 1 status row = 1 overhead
+        let vh = if in_edit { total_h.saturating_sub(4) } else { total_h.saturating_sub(1) };
+        scroll = scroll.min(all_lines.len().saturating_sub(vh));
+
+        // ── build render data ────────────────────────────────────────────
+        let visible: Vec<Line<'static>> = all_lines[scroll..all_lines.len().min(scroll + vh)].to_vec();
+        let pat_line = render_input_line("Pattern:     ", &pat, active_field == 0 && in_edit);
+        let rep_line = render_input_line("Replacement: ", &rep, active_field == 1 && in_edit);
+        let status_text = if let Some(ref e) = regex_error {
+            format!(" Error: {e}")
+        } else if in_edit {
+            " \u{21b5} confirm  \u{00b7}  esc cancel  \u{00b7}  tab switch field  \u{00b7}  ctrl+n/p scroll".to_string()
+        } else if !search_done {
+            format!(" Searching\u{2026} {total_matches} matches  \u{00b7}  y apply  \u{00b7}  e edit  \u{00b7}  i interactive  \u{00b7}  q quit")
+        } else if total_matches > 0 {
+            format!(" {total_matches} matches in {} files  \u{00b7}  y apply  \u{00b7}  e edit  \u{00b7}  i interactive  \u{00b7}  q quit", all_edits.len())
+        } else if pat.text.is_empty() {
+            " Type a pattern  \u{00b7}  esc quit".to_string()
+        } else {
+            " No matches  \u{00b7}  e edit  \u{00b7}  esc quit".to_string()
+        };
+        let status_style = if regex_error.is_some() {
+            Style::default().bg(RColor::Red).fg(RColor::White)
+        } else if in_edit {
+            Style::default().bg(RColor::Blue).fg(RColor::White)
+        } else {
+            Style::default().bg(RColor::DarkGray)
+        };
+
         terminal.draw(|f| {
             let area = f.area();
-            let vh = area.height.saturating_sub(1) as usize;
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(1)])
-                .split(area);
-
-            let end = all_lines.len().min(cur_scroll + vh);
-            let visible: Vec<Line<'static>> = all_lines[cur_scroll..end].to_vec();
-            f.render_widget(Paragraph::new(visible), chunks[0]);
-
-            let status = if search_done {
-                format!(
-                    " {} matches in {} files · y apply · e edit · i interactive · q quit",
-                    cur_total, cur_files
-                )
+            if in_edit {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)])
+                    .split(area);
+                f.render_widget(Paragraph::new(vec![pat_line, rep_line]), chunks[0]);
+                f.render_widget(
+                    Paragraph::new(visible).block(
+                        ratatui::widgets::Block::default()
+                            .borders(ratatui::widgets::Borders::TOP)
+                            .border_style(Style::default().fg(RColor::DarkGray)),
+                    ),
+                    chunks[1],
+                );
+                f.render_widget(Paragraph::new(status_text).style(status_style), chunks[2]);
             } else {
-                format!(" Searching… {} matches · y apply · e edit · i interactive · q quit", cur_total)
-            };
-            f.render_widget(
-                Paragraph::new(status).style(Style::default().bg(RColor::DarkGray)),
-                chunks[1],
-            );
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(1)])
+                    .split(area);
+                f.render_widget(Paragraph::new(visible), chunks[0]);
+                f.render_widget(Paragraph::new(status_text).style(status_style), chunks[1]);
+            }
         })?;
 
-        if poll(Duration::from_millis(50))? {
-            let vh = terminal.size()?.height.saturating_sub(1) as usize;
-            match read_event()? {
+        if !poll(Duration::from_millis(50))? { continue; }
+
+        let vh = if in_edit { total_h.saturating_sub(4) } else { total_h.saturating_sub(1) };
+        let ev = read_event()?;
+
+        if in_edit {
+            // ── edit mode keys ───────────────────────────────────────────
+            match ev {
+                Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                    in_edit = false;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => {
+                    let changed = pat.text != snap_pat || rep.text != snap_rep;
+                    pat = InputField::new(&snap_pat);
+                    rep = InputField::new(&snap_rep);
+                    if changed { last_change = Some(std::time::Instant::now() - Duration::from_millis(300)); }
+                    in_edit = false;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Tab, .. })
+                | Event::Key(KeyEvent { code: KeyCode::BackTab, .. }) => {
+                    active_field = 1 - active_field;
+                }
+                // Scroll results without leaving edit mode
+                Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) => { scroll = scroll.saturating_add(1); }
+                Event::Key(KeyEvent { code: KeyCode::Char('p'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) => { scroll = scroll.saturating_sub(1); }
+                Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) => { scroll = scroll.saturating_add(vh); }
+                Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::ALT) => { scroll = scroll.saturating_sub(vh); }
+                Event::Key(KeyEvent { code: KeyCode::Down, .. }) => { scroll = scroll.saturating_add(1); }
+                Event::Key(KeyEvent { code: KeyCode::Up, .. }) => { scroll = scroll.saturating_sub(1); }
+                // Everything else → active input field
+                other => {
+                    let field = if active_field == 0 { &mut pat } else { &mut rep };
+                    if handle_input_key(field, other) {
+                        last_change = Some(std::time::Instant::now());
+                    }
+                }
+            }
+        } else {
+            // ── view mode keys ───────────────────────────────────────────
+            match ev {
                 Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })
                 | Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break 'tui,
-                // plain 'n' aborts; ctrl+n scrolls down (emacs)
                 Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
-                    if !modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    break 'tui
-                }
-                Event::Key(KeyEvent {
-                    code: KeyCode::Char('c'),
-                    modifiers,
-                    ..
-                }) if modifiers.contains(KeyModifiers::CONTROL) => break 'tui,
+                    if !modifiers.contains(KeyModifiers::CONTROL) => break 'tui,
+                Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) => break 'tui,
                 Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => {
-                    action = TuiAction::Apply;
-                    break 'tui;
+                    tui_action = TuiAction::Apply; break 'tui;
                 }
                 Event::Key(KeyEvent { code: KeyCode::Char('i'), .. }) => {
-                    action = TuiAction::Interactive;
-                    break 'tui;
+                    tui_action = TuiAction::Interactive; break 'tui;
                 }
                 Event::Key(KeyEvent { code: KeyCode::Char('e'), .. }) => {
-                    action = TuiAction::Edit;
-                    break 'tui;
+                    snap_pat = pat.text.clone();
+                    snap_rep = rep.text.clone();
+                    in_edit = true;
                 }
-                // ── scroll by line ────────────────────────────────────────
+                // Scroll
                 Event::Key(KeyEvent { code: KeyCode::Char('j'), .. })
-                | Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
-                    scroll = scroll.saturating_add(1);
-                }
+                | Event::Key(KeyEvent { code: KeyCode::Down, .. }) => { scroll = scroll.saturating_add(1); }
                 Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    scroll = scroll.saturating_add(1);
-                }
+                    if modifiers.contains(KeyModifiers::CONTROL) => { scroll = scroll.saturating_add(1); }
                 Event::Key(KeyEvent { code: KeyCode::Char('k'), .. })
-                | Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
-                    scroll = scroll.saturating_sub(1);
-                }
+                | Event::Key(KeyEvent { code: KeyCode::Up, .. }) => { scroll = scroll.saturating_sub(1); }
                 Event::Key(KeyEvent { code: KeyCode::Char('p'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    scroll = scroll.saturating_sub(1);
-                }
-                // ── scroll by page ────────────────────────────────────────
+                    if modifiers.contains(KeyModifiers::CONTROL) => { scroll = scroll.saturating_sub(1); }
                 Event::Key(KeyEvent { code: KeyCode::Char(' '), .. })
                 | Event::Key(KeyEvent { code: KeyCode::PageDown, .. })
-                | Event::Key(KeyEvent { code: KeyCode::Char('f'), .. }) => {
-                    scroll = scroll.saturating_add(vh);
-                }
+                | Event::Key(KeyEvent { code: KeyCode::Char('f'), .. }) => { scroll = scroll.saturating_add(vh); }
                 Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    scroll = scroll.saturating_add(vh);
-                }
+                    if modifiers.contains(KeyModifiers::CONTROL) => { scroll = scroll.saturating_add(vh); }
                 Event::Key(KeyEvent { code: KeyCode::Char('b'), .. })
-                | Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => {
-                    scroll = scroll.saturating_sub(vh);
-                }
+                | Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => { scroll = scroll.saturating_sub(vh); }
                 Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    scroll = scroll.saturating_sub(vh);
-                }
-                // ── jump to top / bottom ──────────────────────────────────
-                Event::Key(KeyEvent { code: KeyCode::Char('g'), .. }) => {
-                    scroll = 0;
-                }
+                    if modifiers.contains(KeyModifiers::ALT) => { scroll = scroll.saturating_sub(vh); }
+                Event::Key(KeyEvent { code: KeyCode::Char('g'), .. }) => { scroll = 0; }
                 Event::Key(KeyEvent { code: KeyCode::Char('<'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    scroll = 0;
-                }
-                Event::Key(KeyEvent { code: KeyCode::Char('G'), .. }) => {
-                    scroll = all_lines.len().saturating_sub(vh);
-                }
+                    if modifiers.contains(KeyModifiers::ALT) => { scroll = 0; }
+                Event::Key(KeyEvent { code: KeyCode::Char('G'), .. }) => { scroll = all_lines.len().saturating_sub(vh); }
                 Event::Key(KeyEvent { code: KeyCode::Char('>'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    scroll = all_lines.len().saturating_sub(vh);
-                }
-                // ── next / prev file (meta+} / meta+{) ───────────────────
+                    if modifiers.contains(KeyModifiers::ALT) => { scroll = all_lines.len().saturating_sub(vh); }
                 Event::Key(KeyEvent { code: KeyCode::Char('}'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    if let Some(&s) = file_starts.iter().find(|&&s| s > scroll) {
-                        scroll = s;
-                    }
+                    if modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(&s) = file_starts.iter().find(|&&s| s > scroll) { scroll = s; }
                 }
                 Event::Key(KeyEvent { code: KeyCode::Char('{'), modifiers, .. })
-                    if modifiers.contains(KeyModifiers::ALT) =>
-                {
-                    if let Some(&s) = file_starts.iter().rev().find(|&&s| s < scroll) {
-                        scroll = s;
-                    }
+                    if modifiers.contains(KeyModifiers::ALT) => {
+                    if let Some(&s) = file_starts.iter().rev().find(|&&s| s < scroll) { scroll = s; }
                 }
                 _ => {}
             }
@@ -474,41 +538,28 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     disable_raw_mode()?;
     drop(terminal);
 
-    match action {
+    match tui_action {
         TuiAction::Apply => {
-            for edit in rx {
-                all_edits.push(edit);
-            }
+            if let Some(r) = search_rx { for edit in r { all_edits.push(edit); } }
+            if all_edits.is_empty() { eprintln!("No matches."); return Ok(()); }
             let total: usize = all_edits.iter().map(|e| e.total_matches()).sum();
             for edit in &all_edits {
                 fs::write(&edit.path, &edit.new_text)
                     .with_context(|| format!("writing {}", edit.path.display()))?;
             }
-            eprintln!("Replaced {} matches across {} files.", total, all_edits.len());
+            eprintln!("Replaced {total} matches across {} files.", all_edits.len());
         }
         TuiAction::Interactive => {
             let (tx2, rx2) = mpsc::channel();
-            for edit in all_edits {
-                tx2.send(edit).ok();
-            }
+            for edit in all_edits { tx2.send(edit).ok(); }
             thread::spawn(move || {
-                for edit in rx {
-                    if tx2.send(edit).is_err() {
-                        break;
-                    }
+                if let Some(r) = search_rx {
+                    for edit in r { if tx2.send(edit).is_err() { break; } }
                 }
             });
             run_interactive(rx2, cli)?;
         }
-        TuiAction::Edit => {
-            drop(rx);
-            let pattern = cli.pattern.as_deref().unwrap_or("");
-            let replacement = cli.replacement.as_deref().unwrap_or("");
-            run_edit_tui(cli, pattern, replacement)?;
-        }
-        TuiAction::Abort => {
-            eprintln!("Aborted.");
-        }
+        TuiAction::Abort => eprintln!("Aborted."),
     }
 
     Ok(())
@@ -1099,6 +1150,30 @@ fn confirm() -> io::Result<bool> {
     Ok(ans == "y" || ans == "yes")
 }
 
+enum PromptChoice { Apply, Abort, Edit, Pager }
+
+fn prompt_no_pager(total: usize, file_count: usize) -> io::Result<PromptChoice> {
+    eprint!("\n{total} matches in {file_count} files");
+    eprint!("\ny apply   n abort   e edit   p pager  ");
+    io::stderr().flush()?;
+    enable_raw_mode()?;
+    let choice = loop {
+        match read_event()? {
+            Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => break PromptChoice::Apply,
+            Event::Key(KeyEvent { code: KeyCode::Char('n'), .. })
+            | Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break PromptChoice::Abort,
+            Event::Key(KeyEvent { code: KeyCode::Char('e'), .. }) => break PromptChoice::Edit,
+            Event::Key(KeyEvent { code: KeyCode::Char('p'), .. }) => break PromptChoice::Pager,
+            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
+                if modifiers.contains(KeyModifiers::CONTROL) => break PromptChoice::Abort,
+            _ => continue,
+        }
+    };
+    disable_raw_mode()?;
+    eprintln!();
+    Ok(choice)
+}
+
 // ── Live edit TUI ─────────────────────────────────────────────────────────────
 
 struct InputField {
@@ -1223,260 +1298,4 @@ fn render_input_line(label: &str, field: &InputField, active: bool) -> Line<'sta
         spans.push(Span::styled(field.text.clone(), Style::default().add_modifier(Modifier::DIM)));
     }
     Line::from(spans)
-}
-
-fn run_edit_tui(cli: &Cli, initial_pattern: &str, initial_replacement: &str) -> Result<()> {
-    let mut pat = InputField::new(initial_pattern);
-    let mut rep = InputField::new(initial_replacement);
-    let mut active: usize = 0; // 0 = pattern, 1 = replacement
-
-    let mut all_lines: Vec<Line<'static>> = Vec::new();
-    let mut all_edits: Vec<FileEdit> = Vec::new();
-    let mut file_starts: Vec<usize> = Vec::new();
-    let mut total_matches: usize = 0;
-    let mut search_done = true;
-    let mut scroll: usize = 0;
-    let mut search_rx: Option<mpsc::Receiver<FileEdit>> = None;
-    // If pre-populated, trigger search immediately (backdate the timer).
-    let mut last_change: Option<std::time::Instant> = if initial_pattern.is_empty() {
-        None
-    } else {
-        Some(std::time::Instant::now() - Duration::from_millis(300))
-    };
-    let mut regex_error: Option<String> = None;
-
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(Hide)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut tui_action = TuiAction::Abort;
-
-    'edit: loop {
-        // Drain search results.
-        if let Some(ref mut r) = search_rx {
-            loop {
-                match r.try_recv() {
-                    Ok(edit) => {
-                        total_matches += edit.total_matches();
-                        file_starts.push(all_lines.len());
-                        let eff = if rep.text.is_empty() { Preview::Old } else { cli.preview.clone() };
-                        let new_lines =
-                            render_file_to_lines(&edit, cli.context, &eff, cli.compact);
-                        all_lines.extend(new_lines);
-                        all_edits.push(edit);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        search_done = true;
-                        search_rx = None;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Debounced search trigger.
-        if let Some(t) = last_change {
-            if t.elapsed() >= Duration::from_millis(200) {
-                last_change = None;
-                search_rx = None; // drop old rx → kills old search thread
-                all_lines.clear();
-                all_edits.clear();
-                file_starts.clear();
-                total_matches = 0;
-                scroll = 0;
-                regex_error = None;
-
-                if !pat.text.is_empty() {
-                    match build_regex(cli, &pat.text) {
-                        Ok(re) => {
-                            search_rx = Some(spawn_search(cli, re, rep.text.clone()));
-                            search_done = false;
-                        }
-                        Err(e) => {
-                            regex_error = Some(e.to_string());
-                            search_done = true;
-                        }
-                    }
-                } else {
-                    search_done = true;
-                }
-            }
-        }
-
-        // Snapshot values needed inside draw closure.
-        let total_h = terminal.size()?.height as usize;
-        let vh = total_h.saturating_sub(4); // 2 inputs + 1 border + 1 status
-        scroll = scroll.min(all_lines.len().saturating_sub(vh));
-
-        let pat_line = render_input_line("Pattern:     ", &pat, active == 0);
-        let rep_line = render_input_line("Replacement: ", &rep, active == 1);
-        let visible_end = all_lines.len().min(scroll + vh);
-        let visible: Vec<Line<'static>> = all_lines[scroll..visible_end].to_vec();
-
-        let status_text = if let Some(ref e) = regex_error {
-            format!(" Error: {e}")
-        } else if !search_done {
-            format!(" Searching… {} matches", total_matches)
-        } else if total_matches > 0 {
-            format!(
-                " {} matches in {} files · tab switch field · enter apply · esc quit",
-                total_matches,
-                all_edits.len()
-            )
-        } else if pat.text.is_empty() {
-            " Type a pattern to search".to_string()
-        } else {
-            " No matches".to_string()
-        };
-        let status_style = if regex_error.is_some() {
-            Style::default().bg(RColor::Red).fg(RColor::White)
-        } else {
-            Style::default().bg(RColor::DarkGray)
-        };
-
-        terminal.draw(|f| {
-            let area = f.area();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(2),
-                    Constraint::Min(0),
-                    Constraint::Length(1),
-                ])
-                .split(area);
-
-            f.render_widget(Paragraph::new(vec![pat_line, rep_line]), chunks[0]);
-
-            f.render_widget(
-                Paragraph::new(visible).block(
-                    ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::TOP)
-                        .border_style(Style::default().fg(RColor::DarkGray)),
-                ),
-                chunks[1],
-            );
-
-            f.render_widget(
-                Paragraph::new(status_text).style(status_style),
-                chunks[2],
-            );
-        })?;
-
-        if !poll(Duration::from_millis(50))? {
-            continue;
-        }
-
-        let vh = terminal.size()?.height.saturating_sub(4) as usize;
-        match read_event()? {
-            Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break 'edit,
-            Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                break 'edit;
-            }
-            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
-                if total_matches > 0 {
-                    tui_action = TuiAction::Apply;
-                    break 'edit;
-                }
-            }
-            // Switch field
-            Event::Key(KeyEvent { code: KeyCode::Tab, .. })
-            | Event::Key(KeyEvent { code: KeyCode::BackTab, .. }) => {
-                active = 1 - active;
-            }
-            // Scroll results
-            Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                scroll = scroll.saturating_add(1);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('p'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                scroll = scroll.saturating_sub(1);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                scroll = scroll.saturating_add(vh);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::ALT) =>
-            {
-                scroll = scroll.saturating_sub(vh);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
-                scroll = scroll.saturating_add(1);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
-                scroll = scroll.saturating_sub(1);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('>'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::ALT) =>
-            {
-                scroll = all_lines.len().saturating_sub(vh);
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('<'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::ALT) =>
-            {
-                scroll = 0;
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('}'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::ALT) =>
-            {
-                if let Some(&s) = file_starts.iter().find(|&&s| s > scroll) {
-                    scroll = s;
-                }
-            }
-            Event::Key(KeyEvent { code: KeyCode::Char('{'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::ALT) =>
-            {
-                if let Some(&s) = file_starts.iter().rev().find(|&&s| s < scroll) {
-                    scroll = s;
-                }
-            }
-            // Everything else goes to the active input field.
-            ev => {
-                let field = if active == 0 { &mut pat } else { &mut rep };
-                if handle_input_key(field, ev) {
-                    last_change = Some(std::time::Instant::now());
-                }
-            }
-        }
-    }
-
-    terminal.backend_mut().execute(LeaveAlternateScreen)?;
-    terminal.backend_mut().execute(Show)?;
-    disable_raw_mode()?;
-    drop(terminal);
-
-    match tui_action {
-        TuiAction::Apply => {
-            if let Some(r) = search_rx {
-                for edit in r {
-                    all_edits.push(edit);
-                }
-            }
-            if all_edits.is_empty() {
-                eprintln!("No matches.");
-                return Ok(());
-            }
-            let total: usize = all_edits.iter().map(|e| e.total_matches()).sum();
-            for edit in &all_edits {
-                fs::write(&edit.path, &edit.new_text)
-                    .with_context(|| format!("writing {}", edit.path.display()))?;
-            }
-            eprintln!("Replaced {} matches across {} files.", total, all_edits.len());
-        }
-        TuiAction::Interactive | TuiAction::Edit | TuiAction::Abort => {
-            eprintln!("Aborted.");
-        }
-    }
-
-    Ok(())
 }
