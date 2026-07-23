@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
@@ -12,7 +13,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use regex::{Regex, RegexBuilder};
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use termcolor::{Ansi, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 #[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
 enum Preview {
@@ -73,6 +74,9 @@ struct Cli {
     /// One line per match instead of the full diff+context view
     #[arg(short = 'c', long)]
     compact: bool,
+    /// Do not pipe output through a pager
+    #[arg(long)]
+    no_pager: bool,
 }
 
 #[derive(Clone)]
@@ -187,17 +191,26 @@ fn spawn_search(cli: &Cli, re: Regex) -> mpsc::Receiver<FileEdit> {
 // ── Batch mode ───────────────────────────────────────────────────────────────
 
 fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
-    let mut out = StandardStream::stdout(ColorChoice::Auto);
-    let mut edits: Vec<FileEdit> = Vec::new();
+    // Use a pager when stdout is a TTY and --no-pager wasn't given.
+    // Auto-disabled when piped (is_terminal() returns false).
+    let use_pager = !cli.no_pager && io::stdout().is_terminal();
 
-    for edit in &rx {
-        if cli.compact {
-            print_file_compact(&edit, &cli.preview, &mut out)?;
+    let edits = if use_pager {
+        if let Some((mut out, mut child)) = try_spawn_pager() {
+            let edits = collect_and_display(rx, cli, &mut out)?;
+            drop(out); // close pager stdin → signals EOF to the pager
+            let _ = child.wait();
+            edits
         } else {
-            print_file_preview(&edit, cli.context, &cli.preview, &mut out)?;
+            // Pager spawn failed; fall back to direct stdout.
+            let mut out = StandardStream::stdout(ColorChoice::Auto);
+            collect_and_display(rx, cli, &mut out)?
         }
-        edits.push(edit);
-    }
+    } else {
+        let color = if io::stdout().is_terminal() { ColorChoice::Auto } else { ColorChoice::Never };
+        let mut out = StandardStream::stdout(color);
+        collect_and_display(rx, cli, &mut out)?
+    };
 
     if edits.is_empty() {
         eprintln!("No matches.");
@@ -218,6 +231,43 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     }
     eprintln!("Replaced {} matches across {} files.", total, edits.len());
     Ok(())
+}
+
+fn collect_and_display<W: WriteColor>(
+    rx: mpsc::Receiver<FileEdit>,
+    cli: &Cli,
+    out: &mut W,
+) -> Result<Vec<FileEdit>> {
+    let mut edits = Vec::new();
+    for edit in &rx {
+        if cli.compact {
+            print_file_compact(&edit, &cli.preview, out)?;
+        } else {
+            print_file_preview(&edit, cli.context, &cli.preview, out)?;
+        }
+        edits.push(edit);
+    }
+    Ok(edits)
+}
+
+// Spawns $PAGER (defaulting to `less -RF`) with a piped stdin.
+// Returns None if the spawn fails, so callers can fall back gracefully.
+fn try_spawn_pager() -> Option<(Ansi<BufWriter<std::process::ChildStdin>>, Child)> {
+    let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+
+    let mut cmd = Command::new(&pager_cmd);
+    // -R: pass ANSI colour codes through; -F: quit immediately if output fits one screen
+    let name = std::path::Path::new(&pager_cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if name == "less" {
+        cmd.arg("-RF");
+    }
+
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::inherit()).spawn().ok()?;
+    let stdin = child.stdin.take()?;
+    Some((Ansi::new(BufWriter::new(stdin)), child))
 }
 
 // ── Interactive mode ──────────────────────────────────────────────────────────
@@ -288,14 +338,12 @@ fn run_interactive(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                 }
             }
             FileControl::ApplyAll { from_ci } => {
-                // Accept all remaining changes in the current file.
                 for remaining in &edit.changes[from_ci..] {
                     apply_change(&mut current_lines, remaining);
                     accepted_total += remaining.match_count;
                 }
                 write_lines(&edit.path, &current_lines)?;
 
-                // Drain remaining files from the channel (blocks until search done).
                 let rest: Vec<FileEdit> = rx.into_iter().collect();
 
                 if !rest.is_empty() {
@@ -318,7 +366,6 @@ fn run_interactive(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                 return Ok(());
             }
             FileControl::Quit => {
-                // Write the current file with whatever was accepted before quit.
                 if file_modified {
                     write_lines(&edit.path, &current_lines)?;
                 }
@@ -370,7 +417,7 @@ fn write_lines(path: &PathBuf, lines: &[String]) -> Result<()> {
 
 // ── Display ───────────────────────────────────────────────────────────────────
 
-fn print_interactive_match(
+fn print_interactive_match<W: WriteColor>(
     path: &PathBuf,
     change: &Change,
     match_num: usize,
@@ -379,7 +426,7 @@ fn print_interactive_match(
     lines: &[String],
     context: usize,
     preview: &Preview,
-    out: &mut StandardStream,
+    out: &mut W,
 ) -> io::Result<()> {
     let dim = dimmed();
     let path_spec = spec(Color::Magenta, true);
@@ -403,7 +450,7 @@ fn print_interactive_match(
     Ok(())
 }
 
-fn print_file_compact(edit: &FileEdit, preview: &Preview, out: &mut StandardStream) -> io::Result<()> {
+fn print_file_compact<W: WriteColor>(edit: &FileEdit, preview: &Preview, out: &mut W) -> io::Result<()> {
     let path_spec = spec(Color::Magenta, true);
     let num = spec(Color::Cyan, false);
     let yellow_bold = spec(Color::Yellow, true);
@@ -429,11 +476,11 @@ fn print_file_compact(edit: &FileEdit, preview: &Preview, out: &mut StandardStre
     Ok(())
 }
 
-fn print_file_preview(
+fn print_file_preview<W: WriteColor>(
     edit: &FileEdit,
     context: usize,
     preview: &Preview,
-    out: &mut StandardStream,
+    out: &mut W,
 ) -> io::Result<()> {
     let path_spec = spec(Color::Magenta, true);
     let dim = dimmed();
@@ -458,8 +505,8 @@ fn print_file_preview(
     Ok(())
 }
 
-fn print_hunk(
-    out: &mut StandardStream,
+fn print_hunk<W: WriteColor>(
+    out: &mut W,
     lines: &[String],
     change_map: &HashMap<usize, &Change>,
     start: usize,
@@ -527,8 +574,8 @@ fn print_hunk(
     Ok(())
 }
 
-fn write_segments(
-    out: &mut StandardStream,
+fn write_segments<W: WriteColor>(
+    out: &mut W,
     segments: &[(String, bool)],
     highlight: &ColorSpec,
 ) -> io::Result<()> {
