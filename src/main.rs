@@ -349,8 +349,13 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
             let vh = terminal.size()?.height.saturating_sub(1) as usize;
             match read_event()? {
                 Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })
-                | Event::Key(KeyEvent { code: KeyCode::Char('n'), .. })
                 | Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break 'tui,
+                // plain 'n' aborts; ctrl+n scrolls down (emacs)
+                Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
+                    if !modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    break 'tui
+                }
                 Event::Key(KeyEvent {
                     code: KeyCode::Char('c'),
                     modifiers,
@@ -364,27 +369,60 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                     action = TuiAction::Interactive;
                     break 'tui;
                 }
+                // ── scroll by line ────────────────────────────────────────
                 Event::Key(KeyEvent { code: KeyCode::Char('j'), .. })
                 | Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
+                    scroll = scroll.saturating_add(1);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('n'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     scroll = scroll.saturating_add(1);
                 }
                 Event::Key(KeyEvent { code: KeyCode::Char('k'), .. })
                 | Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
                     scroll = scroll.saturating_sub(1);
                 }
+                Event::Key(KeyEvent { code: KeyCode::Char('p'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    scroll = scroll.saturating_sub(1);
+                }
+                // ── scroll by page ────────────────────────────────────────
                 Event::Key(KeyEvent { code: KeyCode::Char(' '), .. })
                 | Event::Key(KeyEvent { code: KeyCode::PageDown, .. })
                 | Event::Key(KeyEvent { code: KeyCode::Char('f'), .. }) => {
+                    scroll = scroll.saturating_add(vh);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     scroll = scroll.saturating_add(vh);
                 }
                 Event::Key(KeyEvent { code: KeyCode::Char('b'), .. })
                 | Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => {
                     scroll = scroll.saturating_sub(vh);
                 }
+                Event::Key(KeyEvent { code: KeyCode::Char('v'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    scroll = scroll.saturating_sub(vh);
+                }
+                // ── jump to top / bottom ──────────────────────────────────
                 Event::Key(KeyEvent { code: KeyCode::Char('g'), .. }) => {
                     scroll = 0;
                 }
+                Event::Key(KeyEvent { code: KeyCode::Char('<'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    scroll = 0;
+                }
                 Event::Key(KeyEvent { code: KeyCode::Char('G'), .. }) => {
+                    scroll = all_lines.len().saturating_sub(vh);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('>'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::ALT) =>
+                {
                     scroll = all_lines.len().saturating_sub(vh);
                 }
                 _ => {}
