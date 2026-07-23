@@ -9,5 +9,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"
 ignore = "0.4"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 regex = "1"
 termcolor = "1"

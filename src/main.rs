@@ -1,19 +1,29 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{read as read_event, Event, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::cursor::{Hide, Show};
+use crossterm::event::{poll, read as read_event, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use crossterm::ExecutableCommand;
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color as RColor, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
 use regex::{Regex, RegexBuilder};
-use termcolor::{Ansi, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 
 #[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
 enum Preview {
@@ -111,6 +121,12 @@ enum FileControl {
     Quit,
 }
 
+enum TuiAction {
+    Apply,
+    Interactive,
+    Abort,
+}
+
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
     if cli.paths.is_empty() {
@@ -205,25 +221,13 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    // Use a pager when stdout is a TTY and --no-pager wasn't given.
-    let use_pager = !cli.no_pager;
+    // TUI pager unless --no-pager or -y (which implies non-interactive).
+    if !cli.no_pager && !cli.yes {
+        return run_pager_tui(rx, cli);
+    }
 
-    let edits = if use_pager {
-        if let Some((mut out, mut child)) = try_spawn_pager() {
-            let edits = collect_and_display(rx, cli, &mut out)?;
-            drop(out); // close pager stdin → signals EOF to the pager
-            let _ = child.wait();
-            edits
-        } else {
-            // Pager spawn failed; fall back to direct stdout.
-            let mut out = StandardStream::stdout(ColorChoice::Auto);
-            collect_and_display(rx, cli, &mut out)?
-        }
-    } else {
-        let color = if io::stdout().is_terminal() { ColorChoice::Auto } else { ColorChoice::Never };
-        let mut out = StandardStream::stdout(color);
-        collect_and_display(rx, cli, &mut out)?
-    };
+    let mut out = StandardStream::stdout(ColorChoice::Auto);
+    let edits = collect_and_display(rx, cli, &mut out)?;
 
     if edits.is_empty() {
         eprintln!("No matches.");
@@ -263,24 +267,292 @@ fn collect_and_display<W: WriteColor>(
     Ok(edits)
 }
 
-// Spawns $PAGER (defaulting to `less -RF`) with a piped stdin.
-// Returns None if the spawn fails, so callers can fall back gracefully.
-fn try_spawn_pager() -> Option<(Ansi<BufWriter<std::process::ChildStdin>>, Child)> {
-    let pager_cmd = std::env::var("PAGER").unwrap_or_else(|_| "less".to_string());
+fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
+    let first = match rx.recv() {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("No matches.");
+            return Ok(());
+        }
+    };
 
-    let mut cmd = Command::new(&pager_cmd);
-    // -R: pass ANSI colour codes through; -F: quit immediately if output fits one screen
-    let name = std::path::Path::new(&pager_cmd)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if name == "less" {
-        cmd.arg("-RF");
+    let mut total_matches = first.total_matches();
+    let mut all_lines = render_file_to_lines(&first, cli.context, &cli.preview, cli.compact);
+    let mut all_edits: Vec<FileEdit> = vec![first];
+    let mut search_done = false;
+
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    stdout.execute(EnterAlternateScreen)?;
+    stdout.execute(Hide)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut scroll: usize = 0;
+    let mut action = TuiAction::Abort;
+
+    'tui: loop {
+        // Drain any results that arrived since the last frame.
+        loop {
+            match rx.try_recv() {
+                Ok(edit) => {
+                    total_matches += edit.total_matches();
+                    let new_lines =
+                        render_file_to_lines(&edit, cli.context, &cli.preview, cli.compact);
+                    all_lines.extend(new_lines);
+                    all_edits.push(edit);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    search_done = true;
+                    break;
+                }
+            }
+        }
+
+        // Clamp scroll before rendering.
+        {
+            let h = terminal.size()?.height.saturating_sub(1) as usize;
+            scroll = scroll.min(all_lines.len().saturating_sub(h));
+        }
+
+        let cur_scroll = scroll;
+        let cur_total = total_matches;
+        let cur_files = all_edits.len();
+        terminal.draw(|f| {
+            let area = f.area();
+            let vh = area.height.saturating_sub(1) as usize;
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(0), Constraint::Length(1)])
+                .split(area);
+
+            let end = all_lines.len().min(cur_scroll + vh);
+            let visible: Vec<Line<'static>> = all_lines[cur_scroll..end].to_vec();
+            f.render_widget(Paragraph::new(visible), chunks[0]);
+
+            let status = if search_done {
+                format!(
+                    " {} matches in {} files · y apply · i interactive · q quit",
+                    cur_total, cur_files
+                )
+            } else {
+                format!(" Searching… {} matches", cur_total)
+            };
+            f.render_widget(
+                Paragraph::new(status).style(Style::default().bg(RColor::DarkGray)),
+                chunks[1],
+            );
+        })?;
+
+        if poll(Duration::from_millis(50))? {
+            let vh = terminal.size()?.height.saturating_sub(1) as usize;
+            match read_event()? {
+                Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })
+                | Event::Key(KeyEvent { code: KeyCode::Char('n'), .. })
+                | Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break 'tui,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers,
+                    ..
+                }) if modifiers.contains(KeyModifiers::CONTROL) => break 'tui,
+                Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => {
+                    action = TuiAction::Apply;
+                    break 'tui;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('i'), .. }) => {
+                    action = TuiAction::Interactive;
+                    break 'tui;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('j'), .. })
+                | Event::Key(KeyEvent { code: KeyCode::Down, .. }) => {
+                    scroll = scroll.saturating_add(1);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('k'), .. })
+                | Event::Key(KeyEvent { code: KeyCode::Up, .. }) => {
+                    scroll = scroll.saturating_sub(1);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char(' '), .. })
+                | Event::Key(KeyEvent { code: KeyCode::PageDown, .. })
+                | Event::Key(KeyEvent { code: KeyCode::Char('f'), .. }) => {
+                    scroll = scroll.saturating_add(vh);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('b'), .. })
+                | Event::Key(KeyEvent { code: KeyCode::PageUp, .. }) => {
+                    scroll = scroll.saturating_sub(vh);
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('g'), .. }) => {
+                    scroll = 0;
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('G'), .. }) => {
+                    scroll = all_lines.len().saturating_sub(vh);
+                }
+                _ => {}
+            }
+        }
     }
 
-    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::inherit()).spawn().ok()?;
-    let stdin = child.stdin.take()?;
-    Some((Ansi::new(BufWriter::new(stdin)), child))
+    terminal.backend_mut().execute(LeaveAlternateScreen)?;
+    terminal.backend_mut().execute(Show)?;
+    disable_raw_mode()?;
+    drop(terminal);
+
+    match action {
+        TuiAction::Apply => {
+            for edit in rx {
+                all_edits.push(edit);
+            }
+            let total: usize = all_edits.iter().map(|e| e.total_matches()).sum();
+            for edit in &all_edits {
+                fs::write(&edit.path, &edit.new_text)
+                    .with_context(|| format!("writing {}", edit.path.display()))?;
+            }
+            eprintln!("Replaced {} matches across {} files.", total, all_edits.len());
+        }
+        TuiAction::Interactive => {
+            let (tx2, rx2) = mpsc::channel();
+            for edit in all_edits {
+                tx2.send(edit).ok();
+            }
+            thread::spawn(move || {
+                for edit in rx {
+                    if tx2.send(edit).is_err() {
+                        break;
+                    }
+                }
+            });
+            run_interactive(rx2, cli)?;
+        }
+        TuiAction::Abort => {
+            eprintln!("Aborted.");
+        }
+    }
+
+    Ok(())
+}
+
+fn render_file_to_lines(
+    edit: &FileEdit,
+    context: usize,
+    preview: &Preview,
+    compact: bool,
+) -> Vec<Line<'static>> {
+    let path_str = edit.path.display().to_string();
+    let mut lines = vec![Line::from(Span::styled(
+        path_str,
+        Style::default().fg(RColor::Magenta).add_modifier(Modifier::BOLD),
+    ))];
+
+    if compact {
+        for change in &edit.changes {
+            let num = Span::styled(
+                format!("{:>6}  ", change.line_idx + 1),
+                Style::default().fg(RColor::Cyan),
+            );
+            let (segs, hl) = if *preview == Preview::New {
+                (&change.new_segments, Style::default().fg(RColor::Green).add_modifier(Modifier::BOLD))
+            } else {
+                (&change.orig_segments, Style::default().fg(RColor::Yellow).add_modifier(Modifier::BOLD))
+            };
+            let mut spans = vec![num];
+            for (text, is_hl) in segs {
+                spans.push(if *is_hl {
+                    Span::styled(text.clone(), hl)
+                } else {
+                    Span::raw(text.clone())
+                });
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        let change_map: HashMap<usize, &Change> =
+            edit.changes.iter().map(|c| (c.line_idx, c)).collect();
+        let hunks = build_hunks(&edit.changes, context, edit.lines.len());
+
+        for (hi, hunk) in hunks.iter().enumerate() {
+            if hi > 0 {
+                lines.push(Line::from(Span::styled(
+                    "        \u{22ee}",
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+            for line_idx in hunk.start..=hunk.end {
+                let (body, _) = split_nl(&edit.lines[line_idx]);
+                if let Some(change) = change_map.get(&line_idx) {
+                    match preview {
+                        Preview::Old => {
+                            let mut spans = vec![Span::styled(
+                                format!("{:>6}  ", line_idx + 1),
+                                Style::default().fg(RColor::Cyan),
+                            )];
+                            for (text, is_m) in &change.orig_segments {
+                                spans.push(if *is_m {
+                                    Span::styled(text.clone(), Style::default().fg(RColor::Yellow).add_modifier(Modifier::BOLD))
+                                } else {
+                                    Span::raw(text.clone())
+                                });
+                            }
+                            lines.push(Line::from(spans));
+                        }
+                        Preview::New => {
+                            let mut spans = vec![Span::styled(
+                                format!("{:>6}  ", line_idx + 1),
+                                Style::default().fg(RColor::Cyan),
+                            )];
+                            for (text, is_hl) in &change.new_segments {
+                                spans.push(if *is_hl {
+                                    Span::styled(text.clone(), Style::default().fg(RColor::Green).add_modifier(Modifier::BOLD))
+                                } else {
+                                    Span::raw(text.clone())
+                                });
+                            }
+                            lines.push(Line::from(spans));
+                        }
+                        Preview::Diff => {
+                            let mut old_spans = vec![
+                                Span::styled("-", Style::default().fg(RColor::Red).add_modifier(Modifier::BOLD)),
+                                Span::styled(format!("{:>5}  ", line_idx + 1), Style::default().fg(RColor::Cyan)),
+                            ];
+                            for (text, is_m) in &change.orig_segments {
+                                old_spans.push(if *is_m {
+                                    Span::styled(text.clone(), Style::default().fg(RColor::Red).add_modifier(Modifier::BOLD))
+                                } else {
+                                    Span::raw(text.clone())
+                                });
+                            }
+                            lines.push(Line::from(old_spans));
+
+                            let mut new_spans = vec![
+                                Span::styled("+", Style::default().fg(RColor::Green).add_modifier(Modifier::BOLD)),
+                                Span::styled(format!("{:>5}  ", line_idx + 1), Style::default().fg(RColor::Cyan)),
+                            ];
+                            for (text, is_hl) in &change.new_segments {
+                                new_spans.push(if *is_hl {
+                                    Span::styled(text.clone(), Style::default().fg(RColor::Green).add_modifier(Modifier::BOLD))
+                                } else {
+                                    Span::raw(text.clone())
+                                });
+                            }
+                            lines.push(Line::from(new_spans));
+                        }
+                    }
+                } else if *preview == Preview::Diff {
+                    lines.push(Line::from(Span::styled(
+                        format!(" {:>5}  {}", line_idx + 1, body),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                } else {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{:>6}  ", line_idx + 1), Style::default().fg(RColor::Cyan)),
+                        Span::styled(body.to_string(), Style::default().add_modifier(Modifier::DIM)),
+                    ]));
+                }
+            }
+        }
+    }
+
+    lines.push(Line::raw(""));
+    lines
 }
 
 // ── Interactive mode ──────────────────────────────────────────────────────────
