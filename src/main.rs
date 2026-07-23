@@ -279,6 +279,7 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     let mut total_matches = first.total_matches();
     let mut all_lines = render_file_to_lines(&first, cli.context, &cli.preview, cli.compact);
     let mut all_edits: Vec<FileEdit> = vec![first];
+    let mut file_starts: Vec<usize> = vec![0];
     let mut search_done = false;
 
     enable_raw_mode()?;
@@ -299,6 +300,7 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                     total_matches += edit.total_matches();
                     let new_lines =
                         render_file_to_lines(&edit, cli.context, &cli.preview, cli.compact);
+                    file_starts.push(all_lines.len());
                     all_lines.extend(new_lines);
                     all_edits.push(edit);
                 }
@@ -424,6 +426,21 @@ fn run_pager_tui(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                     if modifiers.contains(KeyModifiers::ALT) =>
                 {
                     scroll = all_lines.len().saturating_sub(vh);
+                }
+                // ── next / prev file (meta+} / meta+{) ───────────────────
+                Event::Key(KeyEvent { code: KeyCode::Char('}'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(&s) = file_starts.iter().find(|&&s| s > scroll) {
+                        scroll = s;
+                    }
+                }
+                Event::Key(KeyEvent { code: KeyCode::Char('{'), modifiers, .. })
+                    if modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(&s) = file_starts.iter().rev().find(|&&s| s < scroll) {
+                        scroll = s;
+                    }
                 }
                 _ => {}
             }
