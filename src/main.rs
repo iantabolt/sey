@@ -114,6 +114,7 @@ struct FileEdit {
     lines: Vec<String>,
     changes: Vec<Change>,
     new_text: String,
+    noop_count: usize,
 }
 
 impl FileEdit {
@@ -149,7 +150,7 @@ fn main() -> Result<()> {
         if let Some(r) = cli.replacement.take() { extra.push(PathBuf::from(r)); }
         for p in extra { cli.paths.insert(0, p); }
         if cli.paths.is_empty() { cli.paths.push(PathBuf::from(".")); }
-        return run_tui(&cli, "", "", true, None);
+        return run_tui(&cli, "", "", true, None, 0);
     }
 
     if cli.replacement.is_none() {
@@ -289,24 +290,34 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
     // -y: silent apply, no UI.
     if cli.yes {
         let edits: Vec<FileEdit> = rx.into_iter().collect();
-        if edits.is_empty() { eprintln!("No matches."); return Ok(()); }
+        let noop_total: usize = edits.iter().map(|e| e.noop_count).sum();
+        let edits: Vec<FileEdit> = edits.into_iter().filter(|e| !e.changes.is_empty()).collect();
+        if edits.is_empty() {
+            eprintln!("{}", no_change_message(noop_total));
+            return Ok(());
+        }
         let total: usize = edits.iter().map(|e| e.total_matches()).sum();
         for edit in &edits {
             fs::write(&edit.path, &edit.new_text)
                 .with_context(|| format!("writing {}", edit.path.display()))?;
         }
-        eprintln!("Replaced {total} matches across {} files.", edits.len());
+        eprintln!("Replaced {total} matches across {} files.{}", edits.len(), noop_suffix(noop_total));
         return Ok(());
     }
 
     // -p/--pager: force TUI (start search fresh inside TUI).
     if cli.pager {
-        return run_tui(cli, pat, rep, false, None);
+        return run_tui(cli, pat, rep, false, None, 0);
     }
 
     // Collect all results first so we can decide plain vs TUI.
     let edits: Vec<FileEdit> = rx.into_iter().collect();
-    if edits.is_empty() { eprintln!("No matches."); return Ok(()); }
+    let noop_total: usize = edits.iter().map(|e| e.noop_count).sum();
+    let edits: Vec<FileEdit> = edits.into_iter().filter(|e| !e.changes.is_empty()).collect();
+    if edits.is_empty() {
+        eprintln!("{}", no_change_message(noop_total));
+        return Ok(());
+    }
     let total: usize = edits.iter().map(|e| e.total_matches()).sum();
 
     // -P/--no-pager: force plain output.
@@ -324,21 +335,43 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
                 print_file_preview(edit, cli.context, &cli.preview, &mut out)?;
             }
         }
-        match prompt_no_pager(total, edits.len())? {
+        match prompt_no_pager(total, edits.len(), noop_total)? {
             PromptChoice::ReplaceAll => {
                 for edit in &edits {
                     fs::write(&edit.path, &edit.new_text)
                         .with_context(|| format!("writing {}", edit.path.display()))?;
                 }
-                eprintln!("Replaced {total} matches across {} files.", edits.len());
+                eprintln!("Replaced {total} matches across {} files.{}", edits.len(), noop_suffix(noop_total));
             }
             PromptChoice::Quit => eprintln!("Aborted."),
-            PromptChoice::Edit => run_tui(cli, pat, rep, true, Some(edits))?,
+            PromptChoice::Edit => run_tui(cli, pat, rep, true, Some(edits), noop_total)?,
         }
     } else {
-        run_tui(cli, pat, rep, false, Some(edits))?;
+        run_tui(cli, pat, rep, false, Some(edits), noop_total)?;
     }
     Ok(())
+}
+
+// Wording for when a search finds real regex matches but every computed
+// replacement is byte-identical to the original text (e.g. `sey fn fn`, or
+// an ambiguous unbraced `$1_$1` capture ref) — distinct from finding
+// nothing at all, so it doesn't look like the pattern silently failed.
+fn no_change_message(noop_total: usize) -> String {
+    if noop_total == 0 {
+        "No matches.".to_string()
+    } else {
+        let word = if noop_total == 1 { "match" } else { "matches" };
+        format!("{noop_total} {word} not replaced.")
+    }
+}
+
+fn noop_suffix(noop_total: usize) -> String {
+    if noop_total == 0 {
+        String::new()
+    } else {
+        let word = if noop_total == 1 { "match" } else { "matches" };
+        format!(" ({noop_total} {word} not replaced)")
+    }
 }
 
 fn estimate_output_lines(edits: &[FileEdit], cli: &Cli) -> usize {
@@ -362,6 +395,7 @@ fn run_tui(
     init_rep: &str,
     start_in_edit: bool,
     preloaded: Option<Vec<FileEdit>>,
+    initial_noop: usize,
 ) -> Result<()> {
     let mut pat = InputField::new(init_pat);
     let mut rep = InputField::new(init_rep);
@@ -369,6 +403,7 @@ fn run_tui(
     let mut in_edit = start_in_edit;
     let mut snap_pat = pat.text.clone();
     let mut snap_rep = rep.text.clone();
+    let mut noop_total: usize = initial_noop;
 
     let has_preloaded = preloaded.is_some();
     let (mut all_edits, mut match_list, mut total_matches, mut search_done) =
@@ -419,11 +454,14 @@ fn run_tui(
                 match r.try_recv() {
                     Ok(edit) => {
                         total_matches += edit.total_matches();
-                        let edit_idx = all_edits.len();
-                        for change_idx in 0..edit.changes.len() {
-                            match_list.push(MatchEntry { edit_idx, change_idx });
+                        noop_total += edit.noop_count;
+                        if !edit.changes.is_empty() {
+                            let edit_idx = all_edits.len();
+                            for change_idx in 0..edit.changes.len() {
+                                match_list.push(MatchEntry { edit_idx, change_idx });
+                            }
+                            all_edits.push(edit);
                         }
-                        all_edits.push(edit);
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
@@ -444,6 +482,7 @@ fn run_tui(
                 all_edits.clear();
                 applied.clear();
                 total_matches = 0;
+                noop_total = 0;
                 selected = 0;
                 top_scroll = 0;
                 bottom_scroll = 0;
@@ -522,14 +561,14 @@ fn run_tui(
         // ── build top pane lines ─────────────────────────────────────────
         let top_lines: Vec<Line<'static>> = if match_list.is_empty() {
             let msg = if !search_done {
-                " Searching\u{2026}"
+                " Searching\u{2026}".to_string()
             } else if pat.text.is_empty() {
-                " Type a pattern to search"
+                " Type a pattern to search".to_string()
             } else {
-                " No matches"
+                format!(" {}", no_change_message(noop_total))
             };
             vec![Line::from(Span::styled(
-                msg.to_owned(),
+                msg,
                 Style::default().add_modifier(Modifier::DIM),
             ))]
         } else {
@@ -564,7 +603,7 @@ fn run_tui(
             " \u{21b5} replace mode  \u{00b7}  esc revert  \u{00b7}  tab/shift+tab switch field  \u{00b7}  q quit"
                 .to_string()
         } else if !search_done {
-            format!(" Searching\u{2026} {total_matches} matches  \u{00b7}  \u{21b5} replace  \u{00b7}  shift+\u{21b5} replace all  \u{00b7}  e edit  \u{00b7}  q quit")
+            format!(" Searching\u{2026} {total_matches} matches{}  \u{00b7}  \u{21b5} replace  \u{00b7}  shift+\u{21b5} replace all  \u{00b7}  e edit  \u{00b7}  q quit", noop_suffix(noop_total))
         } else if total_matches > 0 {
             let applied_info = if !applied.is_empty() {
                 format!("  \u{00b7}  {}/{} replaced", applied.len(), match_list.len())
@@ -573,13 +612,13 @@ fn run_tui(
             };
             let pos = format!(" [{}/{}]", selected + 1, match_list.len());
             format!(
-                " {total_matches} matches in {} files{pos}{applied_info}  \u{00b7}  \u{21b5} replace  \u{00b7}  shift+\u{21b5} replace all  \u{00b7}  e edit  \u{00b7}  q quit",
-                all_edits.len()
+                " {total_matches} matches in {} files{}{pos}{applied_info}  \u{00b7}  \u{21b5} replace  \u{00b7}  shift+\u{21b5} replace all  \u{00b7}  e edit  \u{00b7}  q quit",
+                all_edits.len(), noop_suffix(noop_total)
             )
         } else if pat.text.is_empty() {
             " Type a pattern  \u{00b7}  esc quit".to_string()
         } else {
-            " No matches  \u{00b7}  e edit  \u{00b7}  q quit".to_string()
+            format!(" {}  \u{00b7}  e edit  \u{00b7}  q quit", no_change_message(noop_total))
         };
         let status_style = if regex_error.is_some() {
             Style::default().fg(RColor::Red)
@@ -1264,6 +1303,7 @@ fn process_file(path: PathBuf, re: &Regex, repl: &str, fixed: bool) -> Option<Fi
     let lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
 
     let mut changes = Vec::new();
+    let mut noop_count = 0usize;
     let mut new_text = String::with_capacity(text.len());
 
     for (idx, raw) in lines.iter().enumerate() {
@@ -1278,14 +1318,15 @@ fn process_file(path: PathBuf, re: &Regex, repl: &str, fixed: bool) -> Option<Fi
                 new_text.push_str(nl);
                 continue;
             }
+            noop_count += match_count;
         }
         new_text.push_str(raw);
     }
 
-    if changes.is_empty() {
+    if changes.is_empty() && noop_count == 0 {
         None
     } else {
-        Some(FileEdit { path, lines, changes, new_text })
+        Some(FileEdit { path, lines, changes, new_text, noop_count })
     }
 }
 
@@ -1377,8 +1418,8 @@ fn dimmed() -> ColorSpec {
 
 enum PromptChoice { ReplaceAll, Edit, Quit }
 
-fn prompt_no_pager(total: usize, file_count: usize) -> io::Result<PromptChoice> {
-    eprint!("\n{total} matches in {file_count} files");
+fn prompt_no_pager(total: usize, file_count: usize, noop_total: usize) -> io::Result<PromptChoice> {
+    eprint!("\n{total} matches in {file_count} files{}", noop_suffix(noop_total));
     eprint!("\nshift+\u{21b5} replace all  \u{00b7}  e edit  \u{00b7}  q quit  ");
     io::stderr().flush()?;
     enable_raw_mode()?;
