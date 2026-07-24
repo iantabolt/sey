@@ -41,14 +41,15 @@ enum Preview {
 #[command(name = "sey", version, about)]
 struct Cli {
     /// Search pattern (regex by default; use -F for a literal string)
-    #[arg(required_unless_present_any = ["edit", "type_list"])]
     pattern: Option<String>,
     /// Replacement (supports $1 / ${name} capture references)
-    #[arg(required_unless_present_any = ["edit", "type_list"])]
     replacement: Option<String>,
     /// Files or directories to search (default: current directory)
     paths: Vec<PathBuf>,
-    /// Open live pattern/replacement editor (pattern and replacement become optional)
+    /// Extra files or directories to search (useful with shell substitution: -f (fd …))
+    #[arg(short = 'f', long = "files", value_name = "FILE")]
+    files: Vec<PathBuf>,
+    /// Open live pattern/replacement editor (launches TUI directly)
     #[arg(short = 'e', long)]
     edit: bool,
 
@@ -61,9 +62,15 @@ struct Cli {
     /// Treat pattern and replacement as literal text (no regex, no capture refs)
     #[arg(short = 'F', long)]
     fixed_strings: bool,
-    /// Apply without asking for confirmation (batch mode only)
+    /// Apply all changes immediately without confirmation or UI
     #[arg(short = 'y', long)]
     yes: bool,
+    /// Always open the interactive TUI pager
+    #[arg(short = 'p', long)]
+    pager: bool,
+    /// Never open the TUI; print results and prompt inline
+    #[arg(short = 'P', long)]
+    no_pager: bool,
     /// Only touch files matching this glob (repeatable), e.g. -g '*.kt'
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
     globs: Vec<String>,
@@ -88,9 +95,6 @@ struct Cli {
     /// One line per match instead of the full diff+context view
     #[arg(short = 'c', long)]
     compact: bool,
-    /// Do not pipe output through a pager
-    #[arg(long)]
-    no_pager: bool,
     /// Output matches as file:line:col:content (one line per match, no replacement applied).
     /// Automatically enabled when stdout is piped.
     #[arg(long)]
@@ -131,18 +135,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Merge -f/--files into paths so the rest of the code sees one unified list.
+    cli.paths.extend(std::mem::take(&mut cli.files));
+
     // Validate -t/-T up front so a typo'd type name fails fast with a clear
     // message, rather than silently matching zero files deep in a TUI.
     build_types(&cli)?;
 
-    if cli.edit {
-        // In edit mode, any positionals misparse'd into pattern/replacement are actually paths.
+    if cli.pattern.is_none() || cli.edit {
+        // Edit mode: any positionals clap assigned to pattern/replacement slots are paths.
         let mut extra: Vec<PathBuf> = Vec::new();
         if let Some(p) = cli.pattern.take() { extra.push(PathBuf::from(p)); }
         if let Some(r) = cli.replacement.take() { extra.push(PathBuf::from(r)); }
         for p in extra { cli.paths.insert(0, p); }
         if cli.paths.is_empty() { cli.paths.push(PathBuf::from(".")); }
-        return run_tui(&cli, "", "", true);
+        return run_tui(&cli, "", "", true, None);
+    }
+
+    if cli.replacement.is_none() {
+        eprintln!("error: REPLACEMENT is required when PATTERN is given");
+        std::process::exit(1);
     }
 
     if cli.paths.is_empty() {
@@ -264,32 +276,21 @@ fn spawn_search(cli: &Cli, re: Regex, replacement: String) -> mpsc::Receiver<Fil
 // ── Batch mode ───────────────────────────────────────────────────────────────
 
 fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
-    // vimgrep mode: file:line:col:content, one line per match, no replacement applied.
+    // Piped / vimgrep: structured output, no UI, no changes.
     if cli.vimgrep || !io::stdout().is_terminal() {
         let mut out = StandardStream::stdout(ColorChoice::Never);
         for edit in &rx { print_file_vimgrep(&edit, &mut out)?; }
         return Ok(());
     }
 
-    // TUI mode (default).
-    if !cli.no_pager && !cli.yes {
-        let pat = cli.pattern.as_deref().unwrap_or("");
-        let rep = cli.replacement.as_deref().unwrap_or("");
-        return run_tui(cli, pat, rep, false);
-    }
+    let pat = cli.pattern.as_deref().unwrap_or("");
+    let rep = cli.replacement.as_deref().unwrap_or("");
 
-    // --no-pager / -y: print to stdout then prompt.
-    let mut out = StandardStream::stdout(ColorChoice::Auto);
-    let edits = collect_and_display(rx, cli, &mut out)?;
-
-    if edits.is_empty() {
-        eprintln!("No matches.");
-        return Ok(());
-    }
-
-    let total: usize = edits.iter().map(|e| e.total_matches()).sum();
-
+    // -y: silent apply, no UI.
     if cli.yes {
+        let edits: Vec<FileEdit> = rx.into_iter().collect();
+        if edits.is_empty() { eprintln!("No matches."); return Ok(()); }
+        let total: usize = edits.iter().map(|e| e.total_matches()).sum();
         for edit in &edits {
             fs::write(&edit.path, &edit.new_text)
                 .with_context(|| format!("writing {}", edit.path.display()))?;
@@ -298,38 +299,55 @@ fn run_batch(rx: mpsc::Receiver<FileEdit>, cli: &Cli) -> Result<()> {
         return Ok(());
     }
 
-    let pat = cli.pattern.as_deref().unwrap_or("");
-    let rep = cli.replacement.as_deref().unwrap_or("");
-    match prompt_no_pager(total, edits.len())? {
-        PromptChoice::Apply => {
-            for edit in &edits {
-                fs::write(&edit.path, &edit.new_text)
-                    .with_context(|| format!("writing {}", edit.path.display()))?;
+    // -p/--pager: force TUI (start search fresh inside TUI).
+    if cli.pager {
+        return run_tui(cli, pat, rep, false, None);
+    }
+
+    // Collect all results first so we can decide plain vs TUI.
+    let edits: Vec<FileEdit> = rx.into_iter().collect();
+    if edits.is_empty() { eprintln!("No matches."); return Ok(()); }
+    let total: usize = edits.iter().map(|e| e.total_matches()).sum();
+
+    // -P/--no-pager: force plain output.
+    // Default: use plain if output fits on screen, otherwise open TUI.
+    let term_h = crossterm::terminal::size().map(|(_, h)| h as usize).unwrap_or(24);
+    let estimated_lines = estimate_output_lines(&edits, cli);
+    let use_plain = cli.no_pager || estimated_lines <= term_h;
+
+    if use_plain {
+        let mut out = StandardStream::stdout(ColorChoice::Auto);
+        for edit in &edits {
+            if cli.compact {
+                print_file_compact(edit, &cli.preview, &mut out)?;
+            } else {
+                print_file_preview(edit, cli.context, &cli.preview, &mut out)?;
             }
-            eprintln!("Replaced {total} matches across {} files.", edits.len());
         }
-        PromptChoice::Abort => eprintln!("Aborted."),
-        PromptChoice::Edit => run_tui(cli, pat, rep, true)?,
-        PromptChoice::Pager => run_tui(cli, pat, rep, false)?,
+        match prompt_no_pager(total, edits.len())? {
+            PromptChoice::ReplaceAll => {
+                for edit in &edits {
+                    fs::write(&edit.path, &edit.new_text)
+                        .with_context(|| format!("writing {}", edit.path.display()))?;
+                }
+                eprintln!("Replaced {total} matches across {} files.", edits.len());
+            }
+            PromptChoice::Quit => eprintln!("Aborted."),
+            PromptChoice::Edit => run_tui(cli, pat, rep, true, Some(edits))?,
+        }
+    } else {
+        run_tui(cli, pat, rep, false, Some(edits))?;
     }
     Ok(())
 }
 
-fn collect_and_display<W: WriteColor>(
-    rx: mpsc::Receiver<FileEdit>,
-    cli: &Cli,
-    out: &mut W,
-) -> Result<Vec<FileEdit>> {
-    let mut edits = Vec::new();
-    for edit in &rx {
-        if cli.compact {
-            print_file_compact(&edit, &cli.preview, out)?;
-        } else {
-            print_file_preview(&edit, cli.context, &cli.preview, out)?;
-        }
-        edits.push(edit);
-    }
-    Ok(edits)
+fn estimate_output_lines(edits: &[FileEdit], cli: &Cli) -> usize {
+    edits.iter().map(|edit| {
+        let hunks = build_hunks(&edit.changes, cli.context, edit.lines.len());
+        let context_lines: usize = hunks.iter().map(|h| h.end - h.start + 1).sum();
+        let extra_per_change = if cli.preview == Preview::Diff { edit.changes.len() } else { 0 };
+        1 + context_lines + extra_per_change + hunks.len().saturating_sub(1)
+    }).sum()
 }
 
 // ── Unified TUI (view mode + edit mode) ──────────────────────────────────────
@@ -338,7 +356,13 @@ fn collect_and_display<W: WriteColor>(
 // bottom pane = full context for the selected match (j/k/ctrl+n/p to scroll).
 // Edit mode adds two input lines at top; view mode hides them.
 
-fn run_tui(cli: &Cli, init_pat: &str, init_rep: &str, start_in_edit: bool) -> Result<()> {
+fn run_tui(
+    cli: &Cli,
+    init_pat: &str,
+    init_rep: &str,
+    start_in_edit: bool,
+    preloaded: Option<Vec<FileEdit>>,
+) -> Result<()> {
     let mut pat = InputField::new(init_pat);
     let mut rep = InputField::new(init_rep);
     let mut active_field: usize = 0;
@@ -346,12 +370,24 @@ fn run_tui(cli: &Cli, init_pat: &str, init_rep: &str, start_in_edit: bool) -> Re
     let mut snap_pat = pat.text.clone();
     let mut snap_rep = rep.text.clone();
 
-    let mut all_edits: Vec<FileEdit> = Vec::new();
-    let mut match_list: Vec<MatchEntry> = Vec::new();
-    let mut total_matches: usize = 0;
-    let mut search_done = true;
+    let has_preloaded = preloaded.is_some();
+    let (mut all_edits, mut match_list, mut total_matches, mut search_done) =
+        match preloaded {
+            Some(edits) => {
+                let mut ml = Vec::new();
+                let mut tm = 0usize;
+                for (ei, edit) in edits.iter().enumerate() {
+                    tm += edit.total_matches();
+                    for ci in 0..edit.changes.len() {
+                        ml.push(MatchEntry { edit_idx: ei, change_idx: ci });
+                    }
+                }
+                (edits, ml, tm, true)
+            }
+            None => (Vec::new(), Vec::new(), 0, true),
+        };
     let mut search_rx: Option<mpsc::Receiver<FileEdit>> = None;
-    let mut last_change: Option<std::time::Instant> = if init_pat.is_empty() {
+    let mut last_change: Option<std::time::Instant> = if init_pat.is_empty() || has_preloaded {
         None
     } else {
         Some(std::time::Instant::now() - Duration::from_millis(300))
@@ -1338,22 +1374,26 @@ fn dimmed() -> ColorSpec {
 }
 
 
-enum PromptChoice { Apply, Abort, Edit, Pager }
+enum PromptChoice { ReplaceAll, Edit, Quit }
 
 fn prompt_no_pager(total: usize, file_count: usize) -> io::Result<PromptChoice> {
     eprint!("\n{total} matches in {file_count} files");
-    eprint!("\ny apply   n abort   e edit   p pager  ");
+    eprint!("\nshift+\u{21b5} replace all  \u{00b7}  e edit  \u{00b7}  q quit  ");
     io::stderr().flush()?;
     enable_raw_mode()?;
     let choice = loop {
         match read_event()? {
-            Event::Key(KeyEvent { code: KeyCode::Char('y'), .. }) => break PromptChoice::Apply,
-            Event::Key(KeyEvent { code: KeyCode::Char('n'), .. })
-            | Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break PromptChoice::Abort,
+            Event::Key(KeyEvent { code: KeyCode::Enter, modifiers, .. })
+                if modifiers.contains(KeyModifiers::SHIFT) => break PromptChoice::ReplaceAll,
+            Event::Key(KeyEvent { code: KeyCode::Enter, .. }) => {
+                eprint!("\x07"); // bell — plain Enter not accepted here
+                io::stderr().flush()?;
+            }
             Event::Key(KeyEvent { code: KeyCode::Char('e'), .. }) => break PromptChoice::Edit,
-            Event::Key(KeyEvent { code: KeyCode::Char('p'), .. }) => break PromptChoice::Pager,
+            Event::Key(KeyEvent { code: KeyCode::Char('q'), .. })
+            | Event::Key(KeyEvent { code: KeyCode::Esc, .. }) => break PromptChoice::Quit,
             Event::Key(KeyEvent { code: KeyCode::Char('c'), modifiers, .. })
-                if modifiers.contains(KeyModifiers::CONTROL) => break PromptChoice::Abort,
+                if modifiers.contains(KeyModifiers::CONTROL) => break PromptChoice::Quit,
             _ => continue,
         }
     };
