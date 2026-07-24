@@ -47,6 +47,9 @@ sey [OPTIONS] <PATTERN> <REPLACEMENT> [PATHS]...
 | `-w`, `--word` | match whole words only |
 | `-F`, `--fixed-strings` | treat pattern/replacement as literal text |
 | `-g`, `--glob <GLOB>` | only touch matching files (repeatable) |
+| `-t`, `--type <TYPE>` | only touch files of this type (repeatable), e.g. `-t rust` |
+| `-T`, `--type-not <TYPE>` | skip files of this type (repeatable) |
+| `--type-list` | list all supported file types and their globs |
 | `-C`, `--context <N>` | lines of context around each match (default 2) |
 | `-I`, `--interactive` | review and apply changes one at a time |
 | `-y`, `--yes` | apply without confirmation |
