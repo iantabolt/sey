@@ -491,8 +491,9 @@ fn run_tui(
 
         // ── recompute bottom pane when selection changes or data arrives ──
         let sel_changed = last_selected != Some(selected);
+        let was_empty = bottom_lines.is_empty();
         let needs_recompute = sel_changed
-            || (bottom_lines.is_empty()
+            || (was_empty
                 && match_list
                     .get(selected)
                     .and_then(|e| all_edits.get(e.edit_idx))
@@ -503,7 +504,7 @@ fn run_tui(
             if let Some(entry) = match_list.get(selected) {
                 if let Some(edit) = all_edits.get(entry.edit_idx) {
                     bottom_lines = render_match_context(edit, entry.change_idx, &eff_preview);
-                    if sel_changed {
+                    if sel_changed || was_empty {
                         // Scroll to put the match line near the top (index 0 = path header)
                         let match_row = edit.changes[entry.change_idx].line_idx + 1;
                         bottom_scroll = match_row.saturating_sub(2);

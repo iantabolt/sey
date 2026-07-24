@@ -1,11 +1,11 @@
-Output demo/interactive.gif
+Output demo/tui.gif
 
 Require sey
 
 Set Shell "bash"
 Set FontSize 16
 Set Width 1300
-Set Height 700
+Set Height 800
 Set Padding 20
 Set Theme "Catppuccin Mocha"
 Set TypingSpeed 40ms
@@ -14,21 +14,18 @@ Hide
 Type "cd $SEY_DEMO_SCRATCH && clear" Enter
 Show
 
-Type `sey -I -w interpolate substitute .`
+Type `sey -w interpolate substitute . -p`
 Sleep 800ms
 Enter
-Sleep 2s
+Sleep 1.5s
 
-Type "n"
-Sleep 1.8s
-
-Type "y"
-Sleep 1.8s
-
-Type "a"
-Sleep 1.8s
-
-Type "y"
-Sleep 500ms
 Enter
-Sleep 2.5s
+Sleep 800ms
+Enter
+Sleep 800ms
+Down
+Sleep 800ms
+Enter
+Sleep 800ms
+Type "q"
+Sleep 2s
