@@ -2,31 +2,23 @@
 
 _`sey` what was once `sed`._
 
-Find/replace across a directory tree, using ripgrep's regex engine and
-file-walking conventions (`.gitignore` aware, glob/type filters, etc.), with
-the browse-and-replace ergonomics of IntelliJ's find/replace-in-path dialog.
+Ripgrep's regex and file walking. IntelliJ's find/replace ergonomics.
 
 ```
 sey 'foo(\w+)' 'bar$1' src/
 ```
 
-If the results fit on one screen, `sey` just prints a diff-style preview and
-asks once:
+Fits on screen → diff preview, one prompt.
 
-![sey printing a diff preview for a small change, then applying it](demo/basic.gif)
+![diff preview, then applying it](demo/basic.gif)
 
-Bigger result sets (or `-p`) drop into a two-pane TUI instead: a compact match
-list up top, full file context below. Arrow keys move between matches, Enter
-replaces the current one and advances, `e` lets you tweak the pattern/replacement
-live and re-search, and `q` writes whatever you've accepted so far and quits:
+Bigger results (or `-p`) → two-pane TUI.
 
-![sey browsing matches in the two-pane TUI, replacing some, skipping one, then quitting with a partial write](demo/tui.gif)
+![browsing and replacing matches in the TUI](demo/tui.gif)
 
-Pipe the output to another command and `sey` switches to a plain
-`file:line:col:content` listing instead — like `rg --vimgrep` — and makes no
-changes, so it composes cleanly with the rest of your shell:
+Piped → plain `file:line:col:content`, like `rg --vimgrep`. No writes.
 
-![sey printing a rich preview normally, then plain vimgrep-style output once piped](demo/pipe.gif)
+![plain vimgrep-style output once piped](demo/pipe.gif)
 
 ## Install
 
@@ -34,8 +26,7 @@ changes, so it composes cleanly with the rest of your shell:
 curl -fsSL https://raw.githubusercontent.com/iantabolt/sey/master/install.sh | sh
 ```
 
-This builds `sey` from source with `cargo`, so you'll need Rust installed
-(https://rustup.rs). Prebuilt binaries / Homebrew are on the roadmap.
+Builds from source via `cargo`. Needs Rust (https://rustup.rs).
 
 ## Usage
 
@@ -43,52 +34,51 @@ This builds `sey` from source with `cargo`, so you'll need Rust installed
 sey [OPTIONS] [PATTERN] [REPLACEMENT] [PATHS]...
 ```
 
-`PATTERN`/`REPLACEMENT` are optional: omit them (or pass `-e`) to launch the
-TUI straight into its live pattern editor instead of typing a full command
-line up front.
+Omit `PATTERN`/`REPLACEMENT` (or pass `-e`) to launch the live editor.
 
 | Flag | Meaning |
 |---|---|
-| `-f`, `--files <FILE>` | extra files/dirs to search (repeatable), e.g. `-f (fd -e py)` |
-| `-e`, `--edit` | launch straight into the live pattern/replacement editor |
+| `-f`, `--files <FILE>` | extra files/dirs to search (repeatable) |
+| `-e`, `--edit` | launch straight into the live editor |
 | `-i`, `--ignore-case` | case-insensitive match |
 | `-w`, `--word` | match whole words only |
-| `-F`, `--fixed-strings` | treat pattern/replacement as literal text |
-| `-y`, `--yes` | apply every change immediately, no preview or UI |
-| `-p`, `--pager` | always open the two-pane TUI |
-| `-P`, `--no-pager` | never open the TUI; print results and prompt inline |
-| `-g`, `--glob <GLOB>` | only touch matching files (repeatable) |
-| `-t`, `--type <TYPE>` | only touch files of this type (repeatable), e.g. `-t rust` |
-| `-T`, `--type-not <TYPE>` | skip files of this type (repeatable) |
-| `--type-list` | list all supported file types and their globs |
-| `-C`, `--context <N>` | lines of context around each match (default 2) |
-| `-c`, `--compact` | one line per match instead of full diff+context |
+| `-F`, `--fixed-strings` | literal text, no regex |
+| `-y`, `--yes` | apply immediately, no UI |
+| `-p`, `--pager` | always open the TUI |
+| `-P`, `--no-pager` | never open the TUI |
+| `-g`, `--glob <GLOB>` | only matching files (repeatable) |
+| `-t`, `--type <TYPE>` | only this file type (repeatable) |
+| `-T`, `--type-not <TYPE>` | skip this file type (repeatable) |
+| `--type-list` | list file types and exit |
+| `-C`, `--context <N>` | context lines (default 2) |
+| `-c`, `--compact` | one line per match |
 | `--no-ignore` | include hidden/gitignored files |
 | `--preview <old\|new\|diff>` | preview style (default `diff`) |
-| `--vimgrep` | print `file:line:col:content`, one per match, no replacement |
+| `--vimgrep` | `file:line:col:content`, no replacement |
 
-`REPLACEMENT` supports capture references (`$1`, `${name}`) unless `-F` is
-given.
+`REPLACEMENT` supports `$1` / `${name}`, unless `-F`.
 
 ### In the TUI
 
-`↑`/`↓` move between matches, `Enter` replaces the current match and moves to
-the next, `e` jumps into the pattern/replacement fields (typing re-searches
-live, `Tab` switches fields, `Enter` returns to browsing, `Esc` reverts), and
-`q` writes everything you've accepted so far and exits — so quitting early
-leaves a partial replacement, not an aborted one. `Ctrl+C` aborts without
-writing anything.
-`Shift+Enter` replaces every remaining match at once, though whether it's
-recognized as distinct from plain `Enter` depends on your terminal's keyboard
-protocol support.
+| Key | Action |
+|---|---|
+| `↑` / `↓` | move between matches |
+| `Enter` | replace current match, advance |
+| `Shift+Enter` | replace all (terminal-dependent) |
+| `e` | edit pattern/replacement live |
+| `Tab` | switch field, while editing |
+| `q` | write accepted matches, quit |
+| `Ctrl+C` | abort, write nothing |
 
 ## Status
 
-Early and under active development. Flags and defaults may still change.
+Early. Flags and defaults may still change.
 
 ## Acknowledgements
 
-File walking and `.gitignore` handling via the [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) crate, and regex matching via the [`regex`](https://github.com/rust-lang/regex) crate — both foundational to [ripgrep](https://github.com/BurntSushi/ripgrep) and maintained largely by [Andrew Gallant](https://github.com/BurntSushi).
+- [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore) — file walking, `.gitignore`
+- [`regex`](https://github.com/rust-lang/regex) — the regex engine
+- both via [ripgrep](https://github.com/BurntSushi/ripgrep) / [Andrew Gallant](https://github.com/BurntSushi)
 
 ## License
 
